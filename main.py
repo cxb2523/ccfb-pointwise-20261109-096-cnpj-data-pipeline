@@ -105,7 +105,7 @@ def load_postgres_csv(
 ) -> None:
     rows = 0
     load = db.bulk_insert if cfg.loading_strategy == "replace" else db.bulk_upsert
-    for batch, table_name, columns in process_file(csv_path, cfg.batch_size):
+    for batch, table_name, columns in process_file(csv_path, cfg.batch_size, reject_dir=cfg.reject_dir):
         load(batch, table_name, columns)
         rows += len(batch)
         if progress is not None:
@@ -119,7 +119,9 @@ def load_postgres_csv(
 
 def write_parquet_csv(csv_path: Path, parquet: "ParquetWriter", cfg: Config) -> None:
     rows = 0
-    for batch, table_name, _columns in process_file(csv_path, cfg.batch_size, typed=cfg.parquet_typed_output):
+    for batch, table_name, _columns in process_file(
+        csv_path, cfg.batch_size, typed=cfg.parquet_typed_output, reject_dir=cfg.reject_dir
+    ):
         parquet.write_batch(batch, table_name)
         rows += len(batch)
         if rows % 1_000_000 == 0:

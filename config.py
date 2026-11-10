@@ -33,6 +33,9 @@ class Config:
     # The Postgres output is already typed via initial.sql column types;
     # this flag opts Parquet into those date and numeric types.
     parquet_typed_output: bool = False
+    # Sidecar directory for CNPJ rejects (ESTABELE). One CSV per source file,
+    # appended chunk by chunk before the chunk is committed.
+    reject_dir: str = "./rejects"
     # Receives the final Parquet path; repeats for resumed tables before manifest publication.
     # Must be idempotent: every run with this command can execute it again.
     post_file_command: str = ""
@@ -74,6 +77,7 @@ class Config:
             output_format=os.getenv("OUTPUT_FORMAT", "postgres").lower(),
             parquet_output_dir=os.getenv("PARQUET_OUTPUT_DIR", "./parquet"),
             parquet_typed_output=os.getenv("PARQUET_TYPED_OUTPUT", "false").lower() == "true",
+            reject_dir=os.getenv("REJECT_DIR", "./rejects"),
             post_file_command=os.getenv("POST_FILE_COMMAND", ""),
             base_url=os.getenv("BASE_URL", "https://arquivos.receitafederal.gov.br/public.php/webdav"),
             share_token=os.getenv("SHARE_TOKEN", "YggdBLfdninEJX9"),

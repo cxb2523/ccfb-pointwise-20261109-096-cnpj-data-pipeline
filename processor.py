@@ -11,6 +11,7 @@ from pathlib import Path
 
 import polars as pl
 
+from cnpj_validation import split_valid_rows
 from file_types import COLUMNS, FILE_MAPPINGS, OUTPUT_COLUMNS
 from file_types import get_file_type as get_file_type
 
@@ -72,8 +73,21 @@ def convert_encoding(file_path: Path) -> Path:
     return utf8_file
 
 
+def _flush_rejects(rejects: pl.DataFrame, reject_path: Path) -> None:
+    """Append one chunk's rejected CNPJ rows to the sidecar CSV.
+
+    Called before the chunk is yielded for load: if this write fails the
+    exception propagates and the chunk is never committed, so the main store
+    never ends up with rows whose audit trail is missing.
+    """
+    reject_path.parent.mkdir(parents=True, exist_ok=True)
+    include_header = not reject_path.exists()
+    with open(reject_path, "a", encoding="utf-8", newline="") as f:
+        rejects.write_csv(f, include_header=include_header)
+
+
 def process_file(
-    file_path: Path, batch_size: int = 50000, typed: bool = False
+    file_path: Path, batch_size: int = 50000, typed: bool = False, reject_dir: Path | str | None = None
 ) -> Generator[tuple[pl.DataFrame, str, list[str]], None, None]:
     """Process a CSV file and yield batches as Polars DataFrames.
 
@@ -86,6 +100,11 @@ def process_file(
             strings during COPY; Parquet mode opts in via the
             PARQUET_TYPED_OUTPUT flag so the on-disk Parquet has the
             same shape Postgres ends up with.
+        reject_dir: Directory for the CNPJ rejects sidecar (ESTABELE
+            only). Each chunk is validated before it is yielded; rejected
+            rows are appended to <reject_dir>/<file>.rejects.csv with
+            chunk_id, row number, the raw triple, and a reason code.
+            Defaults to ./rejects.
     """
     file_type = get_file_type(file_path.name)
     if not file_type:
@@ -95,6 +114,14 @@ def process_file(
     table_name = FILE_MAPPINGS[file_type]
     input_columns = COLUMNS[file_type]
     output_columns = _output_columns(file_type)
+
+    # socios.cnpj_cpf_do_socio may be a CPF, so the CNPJ gate applies to
+    # ESTABELE only — never to socios.
+    reject_path = None
+    if file_type == "ESTABELE":
+        reject_root = Path(reject_dir) if reject_dir is not None else Path("rejects")
+        reject_path = reject_root / f"{file_path.name}.rejects.csv"
+    chunk_id = 0
 
     # Convert to UTF-8 before passing the file to Polars.
     utf8_file = convert_encoding(file_path)
@@ -124,6 +151,17 @@ def process_file(
                     continue
                 df = transform(df, file_type)
                 df = validate(df, file_type)
+                if reject_path is not None:
+                    df, rejects = split_valid_rows(df, chunk_id)
+                    chunk_id += 1
+                    if not rejects.is_empty():
+                        # Flush BEFORE yielding: a sidecar failure aborts the
+                        # chunk so the main store and the audit trail never
+                        # diverge.
+                        _flush_rejects(rejects, reject_path)
+                        logger.warning(f"{file_path.name} chunk {chunk_id - 1}: {rejects.height} CNPJ rejects")
+                    if df.is_empty():
+                        continue
                 if typed:
                     df = apply_typed_casts(df, file_type)
                 yield df, table_name, output_columns

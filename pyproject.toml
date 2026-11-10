@@ -22,6 +22,7 @@ build-backend = "hatchling.build"
 # initial.sql ships next to database.py, which reads it from its own directory.
 only-include = [
     "file_types.py", "config.py", "database.py", "downloader.py", "processor.py", "parquet_writer.py", "main.py",
+    "cnpj_validation.py",
     "initial.sql",
 ]
 
