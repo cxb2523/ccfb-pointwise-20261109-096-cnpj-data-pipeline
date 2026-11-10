@@ -1,0 +1,388 @@
+"""CSV processing and transformation for CNPJ data files using Polars."""
+
+import csv
+import hashlib
+import logging
+import os
+import tempfile
+from collections.abc import Generator
+from datetime import datetime
+from pathlib import Path
+
+import polars as pl
+
+from file_types import COLUMNS, FILE_MAPPINGS, OUTPUT_COLUMNS
+from file_types import get_file_type as get_file_type
+
+logger = logging.getLogger(__name__)
+
+
+def _output_columns(file_type: str) -> list[str]:
+    return OUTPUT_COLUMNS.get(file_type, COLUMNS[file_type])
+
+
+class LayoutDriftError(ValueError):
+    """Raised when a source CSV has a column count that doesn't match what
+    the pipeline expects for its file type. The source is headerless, so
+    column names are assigned by position."""
+
+
+def check_layout(utf8_file: Path, file_type: str) -> None:
+    """Verify the CSV's column count matches the expected schema.
+
+    RFB CSVs are headerless, so Polars assigns column names by position.
+    Check the first CSV record's field count before binding those names.
+    A blank first record is a mismatch; an empty file is left to Polars.
+    This does not detect reordered columns, field-format errors, or
+    differences in later records.
+
+    A real CSV parser is used (csv.reader with ';' delimiter) instead of a
+    naive split so quoted-field edge cases don't false-positive.
+    """
+    expected = len(COLUMNS[file_type])
+    with open(utf8_file, encoding="utf-8", newline="") as f:
+        reader = csv.reader(f, delimiter=";")
+        try:
+            first_row = next(reader)
+        except StopIteration:
+            return  # empty file; Polars NoDataError handles it cleanly
+    actual = len(first_row)
+    if actual != expected:
+        raise LayoutDriftError(
+            f"Layout drift in {utf8_file.name} ({file_type}): "
+            f"expected {expected} columns, got {actual}. "
+            f"Receita Federal may have changed the file layout - update "
+            f"COLUMNS[{file_type!r}] in file_types.py before re-running."
+        )
+
+
+def convert_encoding(file_path: Path) -> Path:
+    """Convert ISO-8859-1 to UTF-8. Returns path to converted file."""
+    fd, tmp_path = tempfile.mkstemp(suffix=".utf8.csv")
+    os.close(fd)
+    utf8_file = Path(tmp_path)
+    try:
+        with open(file_path, "r", encoding="ISO-8859-1") as infile:
+            with open(utf8_file, "w", encoding="UTF-8") as outfile:
+                for chunk in iter(lambda: infile.read(50 * 1024 * 1024), ""):  # 50MB chunks
+                    outfile.write(chunk)
+    except Exception:
+        utf8_file.unlink(missing_ok=True)
+        raise
+    return utf8_file
+
+
+def process_file(
+    file_path: Path, batch_size: int = 50000, typed: bool = False
+) -> Generator[tuple[pl.DataFrame, str, list[str]], None, None]:
+    """Process a CSV file and yield batches as Polars DataFrames.
+
+    Args:
+        file_path: CSV file to process.
+        batch_size: Polars batch size for streaming reads.
+        typed: When true, cast date/numeric columns to their Polars
+            typed forms (Date, Float64, Int32). Postgres mode leaves
+            this false because the destination column types coerce
+            strings during COPY; Parquet mode opts in via the
+            PARQUET_TYPED_OUTPUT flag so the on-disk Parquet has the
+            same shape Postgres ends up with.
+    """
+    file_type = get_file_type(file_path.name)
+    if not file_type:
+        logger.warning(f"Unknown file type: {file_path.name}")
+        return
+
+    table_name = FILE_MAPPINGS[file_type]
+    input_columns = COLUMNS[file_type]
+    output_columns = _output_columns(file_type)
+
+    # Convert to UTF-8 before passing the file to Polars.
+    utf8_file = convert_encoding(file_path)
+
+    try:
+        check_layout(utf8_file, file_type)
+
+        try:
+            reader = pl.read_csv_batched(
+                utf8_file,
+                separator=";",
+                has_header=False,
+                new_columns=input_columns,
+                encoding="utf8",
+                infer_schema_length=0,
+                null_values=[""],
+                ignore_errors=True,
+                low_memory=False,
+                batch_size=batch_size,
+            )
+        except pl.exceptions.NoDataError:
+            return
+
+        while (batches := reader.next_batches(1)) is not None:
+            for df in batches:
+                if df.is_empty():
+                    continue
+                df = transform(df, file_type)
+                df = validate(df, file_type)
+                if typed:
+                    df = apply_typed_casts(df, file_type)
+                yield df, table_name, output_columns
+    finally:
+        utf8_file.unlink(missing_ok=True)
+
+
+def transform(df: pl.DataFrame, file_type: str) -> pl.DataFrame:
+    """Apply transformations based on file type."""
+
+    # Capital social: "1.234,56" → "1234.56", negative → null
+    if file_type == "EMPRECSV" and "capital_social" in df.columns:
+        df = df.with_columns(pl.col("capital_social").str.replace_all(r"\.", "").str.replace(",", "."))
+        is_negative = pl.col("capital_social").str.starts_with("-")
+        invalid_count = df.filter(is_negative).height
+        if invalid_count > 0:
+            logger.warning(f"capital_social: {invalid_count} negative values → null")
+        df = df.with_columns(
+            pl.when(is_negative).then(None).otherwise(pl.col("capital_social")).alias("capital_social")
+        )
+
+    # Date columns: "0" or "00000000" → null (placeholder cleanup only, validation in validate)
+    if file_type in _DATE_COLS:
+        for col in _DATE_COLS[file_type]:
+            if col in df.columns:
+                df = df.with_columns(
+                    pl.when((pl.col(col) == "0") | (pl.col(col) == "00000000") | (pl.col(col).is_null()))
+                    .then(None)
+                    .otherwise(pl.col(col))
+                    .alias(col)
+                )
+
+    # Estabelecimentos: pad country code
+    if file_type == "ESTABELE" and "pais" in df.columns:
+        df = df.with_columns(pl.col("pais").str.zfill(3))
+
+    # Estabelecimentos: pad 7-digit numeric CEP to 8 (1005010 → 01005010).
+    # See docs/data-audit.md for the dated source measurements.
+    # Narrow rule: only when the value is exactly 7 digits, all-numeric.
+    # Leaves '0', '       0', letters, '00000000', and other shapes untouched
+    # so the data_quality_report keeps surfacing them.
+    if file_type == "ESTABELE" and "cep" in df.columns:
+        needs_pad = pl.col("cep").str.contains(r"^\d{7}$")
+        df = df.with_columns(pl.when(needs_pad).then(pl.col("cep").str.zfill(8)).otherwise(pl.col("cep")).alias("cep"))
+
+    # Socios: backfill the masked CPF so the hash input is total. Foreign
+    # partners frequently arrive with blank CPF; without this they would all
+    # hash with cpf="" and collapse together.
+    if file_type == "SOCIOCSV" and "cnpj_cpf_do_socio" in df.columns:
+        df = df.with_columns(pl.col("cnpj_cpf_do_socio").fill_null("00000000000000"))
+
+    # Socios: deterministic UUID derived from the identity tuple. Lives as
+    # socios.socio_id (PK). nome_socio is normalized for hashing only; the
+    # raw column is left alone. Field separator is U+001F (unit separator)
+    # which does not appear in RFB text.
+    if file_type == "SOCIOCSV":
+        df = _add_socio_id(df)
+
+    return df
+
+
+_SOCIO_ID_SEP = "\x1f"
+
+
+def _canonical_name_expr(col: str) -> pl.Expr:
+    return (
+        pl.col(col).fill_null("").str.normalize("NFC").str.replace_all(r"\s+", " ").str.strip_chars().str.to_lowercase()
+    )
+
+
+def _payload_to_uuid(payload: str) -> str:
+    digest = hashlib.blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
+    return f"{digest[:8]}-{digest[8:12]}-{digest[12:16]}-{digest[16:20]}-{digest[20:]}"
+
+
+_SOCIO_ID_INPUTS = (
+    "cnpj_basico",
+    "identificador_de_socio",
+    "cnpj_cpf_do_socio",
+    "nome_socio",
+    "data_entrada_sociedade",
+)
+
+
+def _add_socio_id(df: pl.DataFrame) -> pl.DataFrame:
+    # Partial frames in unit tests may omit identity columns; the full read
+    # path always provides them, so a missing column there is a bug surfaced
+    # elsewhere.
+    if not all(c in df.columns for c in _SOCIO_ID_INPUTS):
+        return df
+    payload = pl.concat_str(
+        [
+            pl.col("cnpj_basico").fill_null(""),
+            pl.col("identificador_de_socio").fill_null(""),
+            pl.col("cnpj_cpf_do_socio").fill_null(""),
+            _canonical_name_expr("nome_socio"),
+            pl.col("data_entrada_sociedade").cast(pl.Utf8).fill_null(""),
+        ],
+        separator=_SOCIO_ID_SEP,
+    )
+    df = df.with_columns(payload.map_elements(_payload_to_uuid, return_dtype=pl.Utf8).alias("socio_id"))
+    # OUTPUT_COLUMNS["SOCIOCSV"] puts socio_id first; align df so COPY's
+    # column list and the CSV stream agree on order.
+    return df.select(OUTPUT_COLUMNS["SOCIOCSV"])
+
+
+# Date columns by file type (shared between transform and validate)
+_DATE_COLS: dict[str, list[str]] = {
+    "ESTABELE": ["data_situacao_cadastral", "data_inicio_atividade", "data_situacao_especial"],
+    "SIMPLESCSV": [
+        "data_opcao_pelo_simples",
+        "data_exclusao_do_simples",
+        "data_opcao_pelo_mei",
+        "data_exclusao_do_mei",
+    ],
+    "SOCIOCSV": ["data_entrada_sociedade"],
+}
+
+# Exclusions are scheduled ahead (Receita sets year-end dates), so a future
+# value is real data, not an error.
+_FUTURE_DATE_COLS = {"data_exclusao_do_simples", "data_exclusao_do_mei"}
+
+# Brazilian UF codes plus the observed exterior convention EX.
+_VALID_UFS = {
+    "AC",
+    "AL",
+    "AM",
+    "AP",
+    "BA",
+    "CE",
+    "DF",
+    "ES",
+    "GO",
+    "MA",
+    "MG",
+    "MS",
+    "MT",
+    "PA",
+    "PB",
+    "PE",
+    "PI",
+    "PR",
+    "RJ",
+    "RN",
+    "RO",
+    "RR",
+    "RS",
+    "SC",
+    "SE",
+    "SP",
+    "TO",
+    "EX",
+}
+
+# Format validation rules: (column, regex pattern, description)
+_FORMAT_RULES: dict[str, list[tuple[str, str, str]]] = {
+    "EMPRECSV": [
+        ("cnpj_basico", r"^[0-9A-Z]{8}$", "8 caracteres alfanuméricos"),
+        ("natureza_juridica", r"^\d{4}$", "4 dígitos"),
+        ("qualificacao_responsavel", r"^\d{2}$", "2 dígitos"),
+        ("porte", r"^(00|01|03|05)$", "00, 01, 03 ou 05"),
+    ],
+    "ESTABELE": [
+        ("cnpj_basico", r"^[0-9A-Z]{8}$", "8 caracteres alfanuméricos"),
+        ("cnpj_ordem", r"^[0-9A-Z]{4}$", "4 caracteres alfanuméricos"),
+        ("cnpj_dv", r"^\d{2}$", "2 dígitos"),
+        ("situacao_cadastral", r"^(01|02|03|04|08)$", "01, 02, 03, 04 ou 08"),
+        ("cep", r"^\d{8}$", "8 dígitos"),
+        ("cnae_fiscal_principal", r"^\d{7}$", "7 dígitos"),
+    ],
+    "SOCIOCSV": [
+        ("cnpj_basico", r"^[0-9A-Z]{8}$", "8 caracteres alfanuméricos"),
+        ("identificador_de_socio", r"^[123]$", "1, 2 ou 3"),
+        ("faixa_etaria", r"^\d$", "1 dígito"),
+    ],
+    "SIMPLESCSV": [
+        ("cnpj_basico", r"^[0-9A-Z]{8}$", "8 caracteres alfanuméricos"),
+        ("opcao_pelo_simples", r"^[SN]$", "S ou N"),
+        ("opcao_pelo_mei", r"^[SN]$", "S ou N"),
+    ],
+}
+
+
+def validate(df: pl.DataFrame, file_type: str) -> pl.DataFrame:
+    """Validate field formats. Log invalid counts, nullify clearly broken values."""
+
+    # Format rules (regex)
+    for col, pattern, desc in _FORMAT_RULES.get(file_type, []):
+        if col not in df.columns:
+            continue
+        invalid = pl.col(col).is_not_null() & ~pl.col(col).str.contains(pattern)
+        count = df.filter(invalid).height
+        if count > 0:
+            logger.warning(f"{col}: {count} invalid values (expected {desc})")
+
+    # UF validation (ESTABELE only)
+    if file_type == "ESTABELE" and "uf" in df.columns:
+        invalid_uf = pl.col("uf").is_not_null() & ~pl.col("uf").is_in(list(_VALID_UFS))
+        count = df.filter(invalid_uf).height
+        if count > 0:
+            logger.warning(f"uf: {count} invalid values (not a valid UF code)")
+
+    # Date validation: parse to verify real calendar date, then range check
+    if file_type in _DATE_COLS:
+        today = datetime.now().strftime("%Y%m%d")
+        for col in _DATE_COLS[file_type]:
+            if col not in df.columns:
+                continue
+            # Try parsing as date — catches impossible dates like Feb 30, Apr 31
+            parsed = pl.col(col).str.to_date("%Y%m%d", strict=False)
+            unparseable = pl.col(col).is_not_null() & parsed.is_null()
+            count = df.filter(unparseable).height
+            if count > 0:
+                logger.warning(f"{col}: {count} invalid dates → null (unparseable)")
+                df = df.with_columns(pl.when(unparseable).then(None).otherwise(pl.col(col)).alias(col))
+
+            # Range check: future or before 1900
+            too_late = pl.lit(False) if col in _FUTURE_DATE_COLS else pl.col(col) > today
+            out_of_range = pl.col(col).is_not_null() & (too_late | (pl.col(col) < "19000101"))
+            count = df.filter(out_of_range).height
+            if count > 0:
+                logger.warning(f"{col}: {count} dates out of range → null (future or before 1900)")
+                df = df.with_columns(pl.when(out_of_range).then(None).otherwise(pl.col(col)).alias(col))
+
+    return df
+
+
+def apply_typed_casts(df: pl.DataFrame, file_type: str) -> pl.DataFrame:
+    """Cast string columns to their typed Polars forms.
+
+    Postgres mode doesn't need this - COPY coerces strings via the column
+    types declared in initial.sql. Parquet preserves whatever dtype the
+    DataFrame has, so without explicit casts the date/numeric columns
+    land in Parquet as Utf8 strings. Consumers using DuckDB then end up
+    doing lexicographic comparisons on what they assume are dates/numbers.
+
+    The pipeline calls this after date cleanup and decimal normalization.
+    Numeric casts check representability, not domain membership: for
+    example, identificador_matriz_filial="9" becomes integer 9.
+    Uncastable numeric strings become null because strict=False.
+
+    Date columns supplied with pl.Null dtype cannot use str.strptime.
+    Cast such columns directly to pl.Date so the on-disk Parquet schema
+    stays stable across batches.
+    """
+    if file_type in _DATE_COLS:
+        for col in _DATE_COLS[file_type]:
+            if col not in df.columns:
+                continue
+            col_dtype = df[col].dtype
+            if col_dtype == pl.Utf8:
+                df = df.with_columns(pl.col(col).str.strptime(pl.Date, "%Y%m%d", strict=False).alias(col))
+            elif col_dtype == pl.Null:
+                df = df.with_columns(pl.col(col).cast(pl.Date))
+
+    if file_type == "EMPRECSV" and "capital_social" in df.columns:
+        df = df.with_columns(pl.col("capital_social").cast(pl.Float64, strict=False))
+
+    if file_type == "ESTABELE" and "identificador_matriz_filial" in df.columns:
+        df = df.with_columns(pl.col("identificador_matriz_filial").cast(pl.Int32, strict=False))
+
+    return df

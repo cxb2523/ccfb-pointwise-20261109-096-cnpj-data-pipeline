@@ -1,0 +1,84 @@
+# Receitas
+
+Receitas são arquivos SQL opcionais para quem quer uma camada além da carga bruta. O pipeline não roda esses arquivos automaticamente. Você lê, escolhe, adapta e executa quando fizer sentido.
+
+A regra está em [../docs/post-processing.md](../docs/post-processing.md): o pipeline preserva e mede. Receitas interpretam.
+
+## Disponíveis
+
+| Receita | Arquivo | O que faz |
+|---|---|---|
+| `reference_domains_enriched` | [`postgres/reference_domains_enriched.sql`](postgres/reference_domains_enriched.sql) | Materializa `motivos_enriched`, `paises_enriched` e `qualificacoes_socios_enriched`: a tabela mensal mais linhas suplementares oficiais (SERPRO/Receita ODS) para códigos ausentes do mês, com proveniência por linha. Não altera as tabelas cruas. Pré-requisito de `empresa_detalhe`. |
+| `reference_domain_labels` | [`postgres/reference_domain_labels.sql`](postgres/reference_domain_labels.sql) | Materializa `portes_empresa`, `situacoes_cadastrais`, `indicadores_matriz_filial`, `identificadores_socio` e `faixas_etarias`: dicionários estáticos oficiais para os enums de `porte`, `situacao_cadastral`, `identificador_matriz_filial`, `identificador_de_socio` e `faixa_etaria`, que o pacote mensal entrega só como código, sem CSV de domínio. Não altera as tabelas cruas. Pré-requisito de `empresa_detalhe` e `socios_detalhe`. |
+| `empresa_detalhe` | [`postgres/empresa_detalhe.sql`](postgres/empresa_detalhe.sql) | Junta empresas, estabelecimentos, tabelas de referência (descrições de motivo/país/qualificação vêm das tabelas enriquecidas; descrições de porte/situação/matriz-filial vêm das tabelas de rótulos) e dados do Simples Nacional em uma tabela por estabelecimento. Preserva códigos e valores da fonte. |
+| `data_quality_flags` | [`postgres/data_quality_flags.sql`](postgres/data_quality_flags.sql) | Mede sinais de qualidade por estabelecimento, sem alterar valores. |
+| `estabelecimentos_clean` | [`postgres/estabelecimentos_clean.sql`](postgres/estabelecimentos_clean.sql) | Usa `data_quality_flags` para emitir pares cru/limpo de CEP e capital social. |
+| `cnae_secundaria_exploded` | [`postgres/cnae_secundaria_exploded.sql`](postgres/cnae_secundaria_exploded.sql) | Transforma `cnae_fiscal_secundaria` em uma tabela lateral: uma linha por CNAE secundário. |
+| `cnaes_hierarquia` | [`postgres/cnaes_hierarquia.sql`](postgres/cnaes_hierarquia.sql) | Tabela derivada por subclasse CNAE (grão = `cnaes.codigo`) com os níveis da hierarquia: `divisao`/`grupo`/`classe` (substrings do código) e `secao` (correspondência oficial IBGE/CONCLA CNAE 2.3, `NULL` para divisões desconhecidas). Não altera a tabela `cnaes`. |
+| `socios_quality_flags` | [`postgres/socios_quality_flags.sql`](postgres/socios_quality_flags.sql) | Mede sinais de qualidade por sócio, incluindo representante legal com valor de preenchimento e referências ausentes. |
+| `socios_clean` | [`postgres/socios_clean.sql`](postgres/socios_clean.sql) | Usa `socios_quality_flags` para emitir pares cru/limpo do trio do representante e de `faixa_etaria`. |
+| `socios_detalhe` | [`postgres/socios_detalhe.sql`](postgres/socios_detalhe.sql) | Tabela por sócio que junta `socios` com as descrições de qualificação e país (tabelas enriquecidas) e de `identificador_de_socio` e `faixa_etaria` (tabelas de rótulos). Preserva todos os códigos da fonte, sem mutação de valor. Equivale a `empresa_detalhe` no grão de sócio. Pré-requisitos: `reference_domains_enriched` e `reference_domain_labels`. |
+| `empresas_busca_nome` | [`postgres/empresas_busca_nome.sql`](postgres/empresas_busca_nome.sql) | Tabela de serviço para busca por `razao_social` em matrizes ativas. Inclui descrições de município e CNAE e índices compostos para LIKE prefixo combinado com filtros de UF, município ou CNAE. |
+| `empresas_busca_nome_counts` | [`postgres/empresas_busca_nome_counts.sql`](postgres/empresas_busca_nome_counts.sql) | Rollups de contagem para `empresas_busca_nome` por UF, UF + município (descrição e código) e UF + CNAE. Usa índices únicos parciais para consultar os totais; serve totais exatos sem varrer milhões de linhas a cada request. |
+
+## Como aplicar
+
+Depois da carga (`just run`), rode apenas as receitas que você precisa. Cada receita roda em uma transação; se falhar, as tabelas da execução anterior continuam intactas. Durante a reconstrução, quem lê essas tabelas espera o `COMMIT`. `ON_ERROR_STOP=1` faz o `psql` parar no primeiro erro e sair com código diferente de zero; `set -e` interrompe a sequência, para que uma receita não rode sobre um pré-requisito que falhou:
+
+```bash
+set -e
+
+# Domínios de referência enriquecidos (pré-requisito de empresa_detalhe)
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f recipes/postgres/reference_domains_enriched.sql
+
+# Rótulos estáticos de domínio (pré-requisito de empresa_detalhe)
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f recipes/postgres/reference_domain_labels.sql
+
+# Tabela denormalizada para consulta (depende de reference_domains_enriched e reference_domain_labels)
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f recipes/postgres/empresa_detalhe.sql
+
+# Sinais de qualidade e camada limpa de estabelecimentos
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f recipes/postgres/data_quality_flags.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f recipes/postgres/estabelecimentos_clean.sql
+
+# CNAEs secundários em tabela lateral
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f recipes/postgres/cnae_secundaria_exploded.sql
+
+# Hierarquia CNAE (seção/divisão/grupo/classe) por subclasse
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f recipes/postgres/cnaes_hierarquia.sql
+
+# Sinais de qualidade e camada limpa por sócio
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f recipes/postgres/socios_quality_flags.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f recipes/postgres/socios_clean.sql
+
+# Tabela por sócio com descrições (depende de reference_domains_enriched e reference_domain_labels)
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f recipes/postgres/socios_detalhe.sql
+
+# Tabela de serviço para busca por nome em matrizes ativas
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f recipes/postgres/empresas_busca_nome.sql
+
+# Rollups de contagem para empresas_busca_nome
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f recipes/postgres/empresas_busca_nome_counts.sql
+```
+
+Rode novamente após cada carga mensal para atualizar. Quando uma receita depende de outra, isso aparece no cabeçalho do SQL.
+
+## Consumidores usando Parquet
+
+As receitas hoje são escritas para Postgres porque esse é o caminho testado. Quem usa Parquet pode tratar os arquivos SQL como referência e traduzir para DuckDB, Spark, Polars, Athena ou outra ferramenta que leia Parquet.
+
+Exemplo em DuckDB: substituir uma tabela como `empresas` por `read_parquet('parquet/empresas.parquet')` e ajustar a sintaxe quando necessário. Variantes para outras ferramentas são bem-vindas quando houver demanda clara.
+
+## Princípios para novas receitas
+
+Antes de propor uma receita nova:
+
+1. Serve mais de um consumidor? Se só você usa, mantenha no seu repositório.
+2. É SQL puro e fácil de ler? Se precisa de Python, provavelmente é outra ferramenta, não uma receita.
+3. Deixa claro o que interpreta? Uma receita pode limpar, marcar ou juntar dados, mas precisa dizer qual regra usou.
+4. Preserva a fonte quando possível? Receitas `*_clean` devem manter o valor cru ao lado do valor tratado.
+5. Documenta dependências? O cabeçalho deve dizer quais tabelas ou receitas precisam existir antes.
+
+Receitas em discussão:
+
+- `booleanos` — colunas convenientes como `is_ativa`, `is_matriz`, `is_optante_simples_atual`. Cada uma com a regra documentada.

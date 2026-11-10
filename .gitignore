@@ -1,0 +1,10 @@
+.DS_Store
+.env
+__pycache__/
+.venv/
+temp/
+parquet/
+*.egg-info/
+.pytest_cache/
+.coverage
+coverage.xml

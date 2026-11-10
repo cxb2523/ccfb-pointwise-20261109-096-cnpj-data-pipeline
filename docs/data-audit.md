@@ -1,0 +1,191 @@
+# Auditoria dos dados: núcleo e receitas
+
+Este documento registra o que a Receita Federal entrega, o que o pipeline normaliza e o que deve ficar em receitas SQL opcionais. A regra geral está em [post-processing.md](post-processing.md).
+
+> **Medições datadas:** as contagens citadas abaixo foram feitas em **12/05/2026** contra a entrega 2026-04 carregada em PostgreSQL pelo próprio pipeline. A forma dos dados costuma ser estável, mas os números mudam todo mês. Refaça a medição quando uma decisão depender do volume.
+
+## Resumo
+
+- **A base já carrega bem:** datas, capital social e encoding têm tratamento suficiente para PostgreSQL e Parquet tipado.
+- **A primeira receita útil é `empresa_detalhe`:** uma linha por estabelecimento, com empresas, tabelas de referência e `dados_simples`.
+- **O próximo caso claro é `cnae_fiscal_secundaria`:** hoje é uma string com códigos separados por vírgula. Uma tabela lateral torna consultas por CNAE secundário mais simples.
+- **Os enums sem tabela de lookup já têm receita:** `reference_domain_labels` materializa rótulos oficiais para `porte`, `situacao_cadastral` e `identificador_matriz_filial`, que o pacote mensal entrega só como código, sem CSV de domínio.
+- **Booleanos e CNPJ formatado ficam para receitas futuras.** São conveniências de uso, não fatos novos da fonte.
+
+## Como ler a tabela
+
+- **Forma na fonte** — o que a Receita publica antes de qualquer transformação.
+- **Normalização atual** — o que o pipeline já faz hoje em `processor.py` ou via tipagem em `initial.sql`.
+- **Possível normalização no núcleo** — mudanças universais que poderiam entrar na carga padrão. Vazio = nada a fazer agora.
+- **Receita relacionada** — onde a derivação aplicável vive, ou viveria.
+- **Prioridade** — relativa entre as receitas, não entre normalizações.
+
+## empresas
+
+| Campo | Forma na fonte | Normalização atual | Possível normalização no núcleo | Receita relacionada | Prioridade |
+|---|---|---|---|---|---|
+| `cnpj_basico` | 8 caracteres alfanuméricos (0-9, A-Z), string | validação regex `^[0-9A-Z]{8}$` | — | usado em todas | — |
+| `razao_social` | TEXT, maiúsculas, sem acentos | — | trim de espaços (a confirmar) | — | — |
+| `natureza_juridica` | 4 dígitos, string | validação regex `^\d{4}$` | — | descrição em `empresa_detalhe` | alta |
+| `qualificacao_responsavel` | 2 dígitos, string | validação regex `^\d{2}$` | — | descrição em `empresa_detalhe` (via `qualificacoes_socios_enriched`) | média |
+| `capital_social` | "1.234,56" no CSV, depois "1234.56" string, `DOUBLE PRECISION` em PostgreSQL | conversão de vírgula decimal, negativos → null | já tipado em Parquet com `PARQUET_TYPED_OUTPUT=true` (v1.18+) | — | — |
+| `porte` | "00" \| "01" \| "03" \| "05" \| null | validação regex `^(00\|01\|03\|05)$`; ~50M são `01` (Microempresa), ~15M `05` (Demais), ~2M `03` (EPP), 3K na cauda (`00` Não informado / vazio) | — | descrição (`porte_descricao`) em `empresa_detalhe`, via `portes_empresa` (`reference_domain_labels`) | baixa |
+| `ente_federativo_responsavel` | TEXT, quase sempre vazio; preenchido só para natureza jurídica 1XXX | — | — | adiada: não é tabela de código simples (é o nome do ente público em texto livre, não um enum) | — |
+
+## estabelecimentos
+
+| Campo | Forma na fonte | Normalização atual | Possível normalização no núcleo | Receita relacionada | Prioridade |
+|---|---|---|---|---|---|
+| `cnpj_basico` + `cnpj_ordem` + `cnpj_dv` | strings de 8+4+2: basico/ordem alfanuméricos (`^[0-9A-Z]{8}$` / `^[0-9A-Z]{4}$`), dv numérico (`^\d{2}$`) — ver CNPJ alfanumérico (julho/2026) | — | — | coluna concatenada `cnpj` em `empresa_detalhe` | alta |
+| `identificador_matriz_filial` | "1" \| "2" no CSV, `INTEGER` em PostgreSQL | tipagem via schema | tipado em Parquet (v1.18+) | descrição (`identificador_matriz_filial_descricao`) em `empresa_detalhe`, via `indicadores_matriz_filial` (`reference_domain_labels`) | baixa |
+| `nome_fantasia` | TEXT, maiúsculas, sem acentos | — | trim (a confirmar) | — | — |
+| `situacao_cadastral` | "01" \| "02" \| "03" \| "04" \| "08" | validação regex | — | descrição (`situacao_cadastral_descricao`) em `empresa_detalhe`, via `situacoes_cadastrais` (`reference_domain_labels`); booleanos (`is_ativa`) em receita futura | baixa |
+| `data_situacao_cadastral`, `data_inicio_atividade`, `data_situacao_especial` | YYYYMMDD ou "0"/"00000000" | placeholder → null, parse + range check (1900..hoje), `DATE` em PostgreSQL | tipado em Parquet (v1.18+) | — | — |
+| `situacao_especial` | TEXT, maiúsculas, já por extenso (não é código) | — | — | já é rótulo legível: sem tabela de domínio aplicável, fica como veio | — |
+| `motivo_situacao_cadastral` | 2 dígitos, string | — | — | descrição em `empresa_detalhe` | alta |
+| `cnae_fiscal_principal` | 7 dígitos, string | validação regex `^\d{7}$` | — | descrição em `empresa_detalhe` | alta |
+| `cnae_fiscal_secundaria` | string com códigos de 7 dígitos separados por vírgula, ex: "5914600,8230002,9001999" | — | — | tabela lateral `estabelecimentos_cnae_secundaria(cnpj_basico, cnpj_ordem, cnpj_dv, cnae_codigo)` | alta |
+| `pais` | 3 dígitos com zero-padding | padding `zfill(3)` | — | descrição em `empresa_detalhe` (via `paises_enriched`) | baixa |
+| `uf` | 2 letras | validação contra lista de 27 UFs + "EX" | — | — | — |
+| `municipio` | código de município da Receita Federal, string (geralmente 4 dígitos; coluna aceita até 7) | — | — | descrição em `empresa_detalhe` | alta |
+| `tipo_logradouro`, `logradouro`, `numero`, `complemento`, `bairro` | TEXT, maiúsculas, sem acentos | — | — | concatenação em receita futura (opcional) | baixa |
+| `cep` | 8 dígitos, string | padding `zfill(8)` quando o valor é exatamente 7 dígitos numéricos (a Receita Federal perde o zero à esquerda em ~0,1% das linhas, sobretudo CEPs `0xxxxxxx` de São Paulo) | — | coluna `cep_status` em `data_quality_flags` | média |
+| `ddd_1`, `telefone_1`, etc. | strings de dígitos, sem formatação | — | — | — | — |
+| `correio_eletronico` | TEXT, maiúsculas | — | — | — | — |
+
+## socios
+
+| Campo | Forma na fonte | Normalização atual | Possível normalização no núcleo | Receita relacionada | Prioridade |
+|---|---|---|---|---|---|
+| `cnpj_basico` | 8 caracteres alfanuméricos (0-9, A-Z) | validação regex `^[0-9A-Z]{8}$` | — | — | — |
+| `identificador_de_socio` | "1" \| "2" \| "3" | validação regex | — | descrições em `socios_detalhe` | baixa |
+| `nome_socio` | TEXT | — | — | — | — |
+| `cnpj_cpf_do_socio` | já mascarado pela Receita Federal: `***123456**` (CPF) ou CNPJ completo | substitui null por "00000000000000" para manter a chave primária | — | — | — |
+| `qualificacao_do_socio` | 2 dígitos | — | — | descrição em `socios_detalhe` | baixa |
+| `data_entrada_sociedade` | YYYYMMDD | mesma normalização que outras datas | tipado em Parquet (v1.18+) | — | — |
+| `pais` | 3 dígitos zero-padded (já vem assim da fonte) | — | — | descrição em `socios_detalhe` | baixa |
+| `representante_legal` | `***000000**` quando não há | — | — | valor sentinela → null em receita futura (`socios_cleanup`) | baixa |
+| `qualificacao_do_representante_legal` | "00" quando não há | — | — | valor sentinela → null em receita futura | baixa |
+| `faixa_etaria` | "0".."9" ("0" = não se aplica) | validação regex | — | descrições (`socios_detalhe`) | baixa |
+
+## dados_simples
+
+| Campo | Forma na fonte | Normalização atual | Possível normalização no núcleo | Receita relacionada | Prioridade |
+|---|---|---|---|---|---|
+| `cnpj_basico` | 8 caracteres alfanuméricos (0-9, A-Z), PK | validação regex `^[0-9A-Z]{8}$` | — | — | — |
+| `opcao_pelo_simples` | "S" \| "N" | validação regex | — | incluído cru em `empresa_detalhe` | alta |
+| `data_opcao_pelo_simples`, `data_exclusao_do_simples`, `data_opcao_pelo_mei`, `data_exclusao_do_mei` | YYYYMMDD ou null; exclusões podem vir no futuro (agendadas, ex.: `20261231`) | normalização de datas; as duas exclusões aceitam data futura | tipado em Parquet (v1.18+) | incluído cru em `empresa_detalhe` | alta |
+| `opcao_pelo_mei` | "S" \| "N" | validação regex | — | incluído cru em `empresa_detalhe` | alta |
+
+> Observação: `dados_simples` é por `cnpj_basico` (empresa-nível), não por estabelecimento. Em `empresa_detalhe` essas colunas se repetem em todas as linhas de uma mesma empresa.
+
+## Tabelas de referência (cnaes, motivos, municipios, naturezas_juridicas, paises, qualificacoes_socios)
+
+No PostgreSQL, todas têm a mesma forma: `(codigo, descricao, data_criacao, data_atualizacao)`. Nos arquivos de origem e no Parquet, a forma é apenas `(codigo, descricao)`. Não há normalização aplicável: são tabelas de referência.
+
+> Medição em 12/05/2026: zero órfãos em `estabelecimentos.cnae_fiscal_principal` e `estabelecimentos.municipio` contra suas tabelas de referência. `LEFT JOIN` continua sendo a escolha defensiva para entregas históricas, mas no mês medido `INNER JOIN` produziria o mesmo resultado.
+
+## Pontos de atenção da fonte
+
+A entrega mensal da Receita Federal tem alguns desencontros entre arquivos. O pipeline preserva esses valores e o `scripts/data_quality_report.py` mede cada caso. Receitas opcionais podem marcar, mascarar ou transformar valores em `NULL` quando o consumidor quiser essa interpretação. Medições abaixo em 12/05/2026 contra a entrega 2026-04.
+
+- **`estabelecimentos.motivo_situacao_cadastral = '32'`** — 18.672 linhas referenciam um código presente em `Estabelecimentos.csv` mas ausente do `Motivos.csv` da mesma entrega. A tabela `motivos` crua continua refletindo a entrega (sem o 32). A receita `reference_domains_enriched` resolve o código contra a tabela de domínio oficial do SERPRO: `32` = `Inexistente De Fato – Ade/Cosar` (o `15` é o `Inexistente De Fato` simples; `32` é a variante ADE/COSAR). Quem aplica a receita vê a descrição em `motivos_enriched` e em `empresa_detalhe`; quem não aplica continua vendo `NULL`.
+- **`estabelecimentos.pais` órfãos** — 14 códigos distintos, 1.220 linhas. Mais frequentes: `150` (583), `367` (483), `359` (97). Quase todos em `uf='EX'`; nove linhas em UFs brasileiras (códigos `008`, `009`). É uma diferença entre `Estabelecimentos.csv` e `Paises.csv` da mesma entrega. A receita `reference_domains_enriched` resolve os códigos órfãos confirmados na tabela de domínio oficial do SERPRO (ex.: `150` Jersey, `367` Inglaterra, `321` Guernsey, `994` placeholder "A Designar"; a lista completa está na receita). O `150` fica com confiança média no rótulo, porque o Siscomex/ME rotula esse mesmo código como `Guernsey`. Os códigos `008`, `009` e `452` ficam sem resolução: ausentes das fontes suplementares (008/009 aparecem em UFs brasileiras, então são quase certamente lixo de digitação; 452 não está no SERPRO). O SERPRO grava os códigos sem zero-padding (`15`, `42`), enquanto o pipeline preenche `pais` com `zfill(3)`; a receita usa a forma de 3 dígitos para casar com os dados.
+- **`estabelecimentos.uf = 'EX'`** — 170.865 linhas. Padrão observado para registros no exterior: as mesmas linhas costumam ter `NOME DA CIDADE NO EXTERIOR` preenchido e a coluna `pais` preenchida. O layout oficial da Receita Federal não documenta o código `EX` explicitamente; tratamos como código convencional usado pela Receita Federal, não como código oficial citado em norma.
+- **`empresas.capital_social = 999999999999`** — 124 linhas. Valor suspeito de sentinela para capital não informado/desconhecido. O layout oficial da Receita Federal não documenta este sentinela. Preservado para que o sinal continue visível; uma receita pode mascarar.
+- **`socios.representante_legal = '***000000**'` + `qualificacao_do_representante_legal = '00'`** — 26.730.045 linhas (97% dos sócios). A forma `***000000**` é consistente com a regra pública de mascaramento de CPF (LDO 2018, art. 129 §2º — ocultar os três primeiros dígitos e os dois dígitos verificadores), aplicada sobre um CPF de origem `00000000000`. A leitura "sem representante legal separado" é empírica (97% dos registros), não documentada. Preservado; uma receita pode expor `has_representante_legal` quando o consumidor quiser tratar como `NULL`.
+- **`estabelecimentos.cep` residual após padding** — após o `zfill(8)` aplicado a valores com exatamente 7 dígitos numéricos (v1.21.0+), restam ~2.914 valores não conformes (`'0'`, `'       0'`, 8 caracteres com letras, etc.). Preservados como vieram. Resumo da política:
+  - Correios define CEP como 8 algarismos numéricos.
+  - A Receita Federal entrega alguns CEPs com 7 dígitos numéricos.
+  - O pipeline padroniza exclusivamente os valores com exatamente 7 dígitos numéricos.
+  - Validação de existência contra Correios/DNE está fora do núcleo.
+
+## Domínios de referência enriquecidos (receita `reference_domains_enriched`)
+
+Alguns códigos chegam em `Estabelecimentos.csv`/`Empresas.csv` mas não estão na tabela de lookup da mesma entrega mensal (`Motivos.csv`, `Paises.csv`). Isso não é erro de carga: o pipeline preserva a entrega como veio. Para quem quer a descrição mesmo assim, a receita `recipes/postgres/reference_domains_enriched.sql` materializa `motivos_enriched`, `paises_enriched` e `qualificacoes_socios_enriched`.
+
+Por que isso é uma receita, e não lógica de carga:
+
+- **A carga preserva.** As tabelas cruas (`motivos`, `paises`, `qualificacoes_socios`) continuam idênticas ao arquivo da Receita Federal. Nada é injetado nelas.
+- **A receita interpreta.** Cada tabela enriquecida é a tabela mensal MAIS linhas suplementares oficiais, inseridas só quando o código está ausente do mês (anti-join `NOT EXISTS`). A linha mensal sempre vence; `codigo` é chave primária, então um `LEFT JOIN` com a tabela enriquecida não muda contagem de linhas.
+- **Sem FK rígida na carga.** Não adicionamos `FOREIGN KEY` nem `CHECK` às tabelas cruas para rejeitar esses códigos. Entregas históricas têm códigos retirados; uma FK rígida quebraria a carga em vez de preservar o dado. O sinal de "ausente no mês" vive nas flags de qualidade, não numa restrição.
+- **Proveniência em cada linha.** Colunas `source_kind` (`receita_monthly` | `serpro_dominio` | `receita_ods`), `source_url`, `is_supplemental`, `confidence` (`high` | `medium`) e `notes`. As descrições são mantidas verbatim de cada fonte; linhas mensais vêm em maiúsculas sem acento (entrega RFB), linhas suplementares mantêm a grafia do SERPRO.
+
+Achados oficiais registrados (medição 2026-04, verificados contra as tabelas de domínio do SERPRO):
+
+- **`motivo` 32** — resolvido: `Inexistente De Fato – Ade/Cosar` (confiança alta).
+- **`pais`** — os códigos órfãos presentes na tabela SERPRO são resolvidos (`015`, `042`, `150`, `151`, `200`, `321`, `359`, `367`, `393`, `449`, `498`, `578`, `678`, `693`, `699`, `737`, `755`, `994`). O `150` fica com confiança média (divergência de rótulo Jersey/Guernsey). `015`/`042` precisam de zero-padding: o SERPRO grava `15`/`42`, o pipeline usa `015`/`042`.
+- **`pais` 008, 009, 452** — não resolvidos de propósito: ausentes das fontes suplementares (SERPRO + ODS da Receita).
+- **`qualificacao` 36 = `Gerente-Delegado`** — resolvido como **código legado**. A tabela ODS oficial da Receita marca `COLETADO ATUALMENTE = "Não"`, por isso ele não aparece nas CSVs de coleta atuais do SERPRO mas ainda ocorre em registros antigos. Corroborado pela norma `idArquivoBinario=18132`.
+
+## Rótulos de domínio estáticos (receita `reference_domain_labels`)
+
+Cinco enums chegam no pacote mensal só como código, sem CSV de domínio na própria entrega: `empresas.porte`, `estabelecimentos.situacao_cadastral`, `estabelecimentos.identificador_matriz_filial`, `socios.identificador_de_socio` e `socios.faixa_etaria`. Diferente de `motivo`/`pais`/`qualificacao`, que vêm com `Motivos.csv`/`Paises.csv`/`Qualificacoes.csv` no mesmo pacote, esses não têm tabela de lookup para enriquecer: não há linha mensal a preservar nem a complementar. A receita `recipes/postgres/reference_domain_labels.sql` materializa os rótulos a partir de fontes oficiais: as tabelas de domínio do SERPRO (que opera o cadastro CNPJ) para `porte`/`situacao`/`matriz`, e a prosa do layout do CNPJ da Receita para os dois enums de sócio, que o SERPRO também não publica como CSV.
+
+Por isso são dicionários estáticos, e não tabelas mensal+suplementar:
+
+- **A carga não muda.** A receita é aditiva: cria `portes_empresa`, `situacoes_cadastrais`, `indicadores_matriz_filial`, `identificadores_socio` e `faixas_etarias` e nunca toca em `empresas`, `estabelecimentos` ou `socios`. É idempotente (`DROP TABLE IF EXISTS` + `CREATE TABLE`) e segura para reexecutar após qualquer carga.
+- **Sem maquinário suplementar.** Como não existe tabela mensal por trás, não há anti-join nem coluna `is_supplemental`/`confidence`. Cada linha carrega só `source_kind` (`serpro_dominio` para os códigos das CSVs de domínio do SERPRO; `receita_layout` para o `porte` `00` e para todas as linhas de `identificador_de_socio` e `faixa_etaria`) e `source_url`. A `descricao` das linhas do SERPRO e do `porte` `00` é mantida verbatim da fonte; as de `identificador_de_socio` e `faixa_etaria` são rótulos derivados do layout — o layout descreve esses dois em prosa, não numa tabela código|descrição —, na grafia legível das demais.
+- **`porte` `00` (Não informado)** não está na `porte_empresa.csv` do SERPRO (que lista só `01`/`03`/`05`), mas o EMPRECSV mensal o emite e o validador da carga o aceita (`^(00|01|03|05)$`). É código conhecido, então precisa resolver para descrição em vez de `NULL`; o rótulo vem do layout do CNPJ da Receita, daí o `source_kind` `receita_layout`.
+- **`situacao_cadastral` `05` (Ativa Não Regular)** está no domínio do SERPRO mas fora do regex do layout dos dados abertos (`^(01|02|03|04|08)$`). O validador só registra um aviso para códigos fora do conjunto; o `validate` transforma datas/UF/capital em `NULL`, nunca um código de enum. Então um `05` cru sobrevive à carga e precisa resolver para o rótulo oficial em vez de virar `NULL` pelo `LEFT JOIN` — mesma lógica do `porte` `00` acima. Por isso a `situacoes_cadastrais` carrega o domínio completo do SERPRO.
+- **`identificador_de_socio` e `faixa_etaria`** vêm da prosa do layout do CNPJ da Receita (`cnpj-metadados.pdf`): `identificador_de_socio` (1/2/3) e `faixa_etaria` (`0` = Não se aplica e as faixas de 1 a 9). Como o layout não traz uma tabela código|descrição, os rótulos são derivados em grafia legível, não cópia byte a byte. Alimentam `socios_detalhe`, não `empresa_detalhe`.
+
+`empresa_detalhe` passa a expor `porte_descricao`, `situacao_cadastral_descricao` e `identificador_matriz_filial_descricao` via `LEFT JOIN` com essas três tabelas (1:1 na chave `codigo`, então a contagem de linhas não muda). O código cru continua na linha ao lado da descrição. Por isso `empresa_detalhe` agora depende de `reference_domain_labels` além de `reference_domains_enriched`.
+
+Dois campos vizinhos ficam fora desta receita de propósito:
+
+- **`situacao_especial`** já chega por extenso (texto legível, não código), então não há tabela de domínio a aplicar: fica como veio.
+- **`ente_federativo_responsavel`** é adiado: é o nome do ente público em texto livre, não um enum com tabela de código simples.
+
+## Hierarquia CNAE (receita `cnaes_hierarquia`)
+
+A tabela `cnaes` é plana (`codigo` de 7 dígitos, `descricao`), sem os níveis hierárquicos. A receita `recipes/postgres/cnaes_hierarquia.sql` deriva-os numa tabela por subclasse (grão = `cnaes.codigo`, mesma cardinalidade), sem alterar a tabela crua.
+
+`divisao`, `grupo` e `classe` são substrings do código, sem fonte externa:
+
+- `divisao` = `codigo[1..2]` (ex.: `0111301` → `01`)
+- `grupo` = `codigo[1..3]` (→ `011`)
+- `classe` = `codigo[1..4]` `-` `codigo[5]`, formato `DDDD-D` (→ `0111-3`)
+
+A **seção** (`A`–`U`) não é derivável do código: vem da correspondência divisão→seção do CNAE 2.3 (planilha oficial IBGE/CONCLA, ver Fontes oficiais). Uma divisão fora da lista oficial fica com `secao = NULL`; todo código real da Receita cai numa divisão válida. A tabela traz só os códigos e a `descricao` da subclasse — sem nomes de seção/divisão/grupo.
+
+## Fontes oficiais
+
+Onde cada afirmação acima foi (ou não) verificada contra uma fonte oficial.
+
+- **Algoritmo do dígito verificador do CNPJ** — Receita Federal / Serpro, documento técnico [`manual-dv-cnpj.pdf`](https://www.gov.br/receitafederal/pt-br/centrais-de-conteudo/publicacoes/documentos-tecnicos/cnpj/manual-dv-cnpj.pdf): módulo 11, pesos 5,4,3,2,9,8,7,6,5,4,3,2 (DV1) e 6,5,4,3,2,9,8,7,6,5,4,3,2 (DV2). Regra: se `resto = soma mod 11 ∈ {0,1}`, DV = 0; caso contrário, DV = `11 - resto`. O algoritmo permanece o mesmo no CNPJ alfanumérico que entra em vigor em julho/2026 ([nota da Receita Federal](https://www.gov.br/receitafederal/pt-br/assuntos/noticias/2024/outubro/cnpj-tera-letras-e-numeros-a-partir-de-julho-de-2026)); CNPJs numéricos existentes continuam válidos.
+- **Política para minúsculas no CNPJ alfanumérico** — o alfabeto válido de `cnpj_basico`/`cnpj_ordem` é `[0-9A-Z]` (maiúsculo); a Receita Federal não publica letras minúsculas no layout. O pipeline **rejeita, não normaliza**: a validação regex (`^[0-9A-Z]{8}$` / `^[0-9A-Z]{4}$`) é case-sensitive, então um valor como `12abc345` na fonte falha o formato e é tratado como qualquer outro valor malformado (logado como inválido, mantido cru — ver `validate` em `processor.py`). Isso cobre o dado entregue pela Receita; um consumidor com sua própria caixa de busca (ex.: `cnpj-chat`) pode normalizar entrada de usuário separadamente, sem relação com esta política de ingest.
+- **Forma do CEP (8 algarismos numéricos)** — Correios: ["O CEP é um conjunto numérico constituído de oito algarismos"](https://www.correios.com.br/enviar/precisa-de-ajuda/tudo-sobre-cep).
+- **Existência de um CEP específico** — a base de referência é o DNE/Correios. **Fora do escopo do núcleo do pipeline**: validar por chamada externa adicionaria dependência de autenticação, limite de uso e licenciamento, além de reduzir a reprodutibilidade da carga. Receitas ou ferramentas opcionais podem fazer essa checagem em amostra.
+- **Códigos de município e UF (geografia)** — IBGE é a fonte para enriquecimento geográfico (códigos de município, microrregião, mesorregião). IBGE **não é** fonte para validar CEP.
+- **Hierarquia CNAE (seção)** — IBGE/CONCLA. A correspondência divisão→seção do CNAE-Subclasses 2.3 (21 seções, 87 divisões) vem da planilha oficial [`CNAE_Subclasses_2_3_Estrutura_Detalhada.xlsx`](https://concla.ibge.gov.br/images/concla/documentacao/CNAE_Subclasses_2_3_Estrutura_Detalhada.xlsx), estabelecida pela Resolução CONCLA nº 2, de 19/11/2018 (DOU nº 222). Os 87 pares em `cnaes_hierarquia` foram derivados do parse dessa planilha.
+- **Layout dos dados abertos do CNPJ** — Receita Federal: [`cnpj-metadados.pdf`](https://www.gov.br/receitafederal/dados/cnpj-metadados.pdf). É um documento curto; não enumera valores válidos de `motivo`, `pais`, `uf` (além do que aparece em prosa), nem documenta sentinelas como `999999999999` em `capital_social` ou `'***000000**'` em `representante_legal`.
+- **Tabelas de domínio (motivo, país, qualificação)** — SERPRO, Base de Cadastros, que opera o cadastro CNPJ para a Receita Federal e publica as tabelas de domínio como CSV: [`bcadastros.serpro.gov.br/documentacao/dominios/pj/`](https://bcadastros.serpro.gov.br/documentacao/dominios/pj/) (`motivo_situacao_cadastral.csv`, `pais.csv`, `qualificacao_socio.csv`, `qualificacao_responsavel.csv`, `qualificacao_representante_legal.csv`). É a fonte das linhas suplementares de `reference_domains_enriched`. A tabela de países do Siscomex/Ministério da Economia ([`balanca.economia.gov.br/balanca/bd/tabelas/PAIS.csv`](https://balanca.economia.gov.br/balanca/bd/tabelas/PAIS.csv)) usa a mesma numeração e serve de checagem cruzada; nos casos em que o rótulo diverge (ex.: `150`), o SERPRO prevalece por ser a fonte do cadastro CNPJ.
+- **Tabelas de domínio (porte, situação cadastral, matriz/filial)** — mesmos diretórios do SERPRO: `porte_empresa.csv`, `situacao_cadastral.csv` e `indicador_matriz.csv`. Diferente das anteriores, o pacote mensal do CNPJ não traz CSV de domínio para esses três campos, então a CSV do SERPRO não é fonte suplementar, é a fonte única dos rótulos de `reference_domain_labels`. A única exceção é o `porte` `00` (Não informado), ausente da CSV do SERPRO e tirado do layout do CNPJ da Receita (`cnpj-metadados.pdf`).
+- **Enums de sócio (identificador_de_socio, faixa_etaria)** — como `porte`/`situacao`/`matriz`, o pacote mensal entrega os dois só como código e o SERPRO não publica CSV de domínio para eles. Os rótulos vêm da prosa do layout do CNPJ da Receita ([`cnpj-metadados.pdf`](https://www.gov.br/receitafederal/dados/cnpj-metadados.pdf)): `identificador_de_socio` (1 Pessoa Jurídica, 2 Pessoa Física, 3 Estrangeiro) e `faixa_etaria` (0 Não se aplica e as faixas de 1 a 9). São a fonte `receita_layout` das tabelas `identificadores_socio` e `faixas_etarias` em `reference_domain_labels`, consumidas por `socios_detalhe`.
+- **Qualificação legada (código 36)** — as CSVs de coleta do SERPRO listam só os códigos coletados atualmente. A tabela aberta da Receita ([`tabela-de-qualificacao-do-socio-representante.ods`](https://www.gov.br/receitafederal/pt-br/assuntos/orientacao-tributaria/cadastros/cnpj/tabela-de-qualificacao-do-socio-representante.ods)) inclui a coluna `COLETADO ATUALMENTE` e lista `36 | Gerente-Delegado | Não`, marcando-o como código válido porém legado. Corroborado pela norma `idArquivoBinario=18132` (TABELA III – Qualificação). É a fonte da linha suplementar `receita_ods`.
+
+## Decisões para a primeira receita (empresa_detalhe)
+
+A receita `recipes/postgres/empresa_detalhe.sql` implementa:
+
+- **LEFT JOIN** com `cnaes`, `municipios`, `naturezas_juridicas`, e com as tabelas enriquecidas `motivos_enriched`, `paises_enriched`, `qualificacoes_socios_enriched`: preserva linhas mesmo com códigos retirados, e resolve os códigos suplementares oficiais (ver a receita `reference_domains_enriched`). Por isso a receita depende de `reference_domains_enriched.sql`, aplicada antes.
+- **LEFT JOIN** com `portes_empresa`, `situacoes_cadastrais`, `indicadores_matriz_filial`: traz `porte_descricao`, `situacao_cadastral_descricao` e `identificador_matriz_filial_descricao` para os enums que o pacote mensal entrega só como código. Cada tabela é 1:1 na chave `codigo`, então a contagem de linhas não muda; código desconhecido fica com `descricao` `NULL`. Por isso a receita também depende de `reference_domain_labels.sql`, aplicada antes (ver a seção de rótulos estáticos acima).
+- **`qualificacao_responsavel_descricao`**: descrição da qualificação do responsável pela empresa, via `qualificacoes_socios_enriched`. É uma junção com tabela de referência, no mesmo padrão de `natureza_juridica_descricao`, não uma expansão de enum embutido.
+- **LEFT JOIN** com `dados_simples`: inclui colunas cruas (`opcao_pelo_simples`, datas, `opcao_pelo_mei`). Sem booleanos derivados.
+- **Coluna `cnpj`** = `cnpj_basico || cnpj_ordem || cnpj_dv`: evita repetir a concatenação em consultas.
+- **`CREATE TABLE AS`**: modelo esperado para receitas aplicadas depois do ingest.
+- **Código cru ao lado do rótulo, sem substituição**: a descrição entra como coluna adicional (`situacao_cadastral_descricao`, `porte_descricao`, `identificador_matriz_filial_descricao`); o código cru continua na linha (`situacao_cadastral` segue "02"). Sem booleanos (`is_ativa`, `is_matriz`) — esses ficam para receitas futuras.
+
+## Receitas disponíveis e próximas possibilidades
+
+1. **`data_quality_flags`** (v1.22.0+, recipeVersion 2 com os sinais enriquecidos) — tabela estreita, uma linha por estabelecimento, com sinais sem mutação de valor: `cep_status`, `is_exterior`, `pais_lookup_missing`, `motivo_lookup_missing`, `pais_enriched_lookup_missing`, `motivo_enriched_lookup_missing`, `capital_social_is_suspicious_sentinel`. Os pares `*_lookup_missing` (mensal) e `*_enriched_lookup_missing` (enriquecido) ficam separados de propósito: o primeiro mede a lacuna interna da entrega; o segundo mede o que continua sem resolução depois das linhas suplementares oficiais (depende de `reference_domains_enriched`). Serve como predicate-source para `estabelecimentos_clean`. Sócios ficam em `socios_quality_flags` por terem grão diferente.
+2. **`estabelecimentos_clean`** (v1.23.0+) — junta `estabelecimentos`, `empresas` e `data_quality_flags`. Primeira receita que altera valores: emite `cep_clean` (NULL quando `cep_status != 'valid_shape'`) e `capital_social_clean` (NULL quando `capital_social_is_suspicious_sentinel`). Preserva os valores crus (`cep_raw`, `capital_social_raw`) ao lado das colunas limpas. Usa exclusivamente os predicados de `data_quality_flags` — qualquer mudança de interpretação acontece lá, não aqui.
+3. **`cnae_secundaria_exploded`** (v1.24.0+) — tabela lateral que faz unnest de `cnae_fiscal_secundaria`. Uma linha por (estabelecimento, CNAE secundário). Medido em 12/05/2026 contra a entrega 2026-04: 33.187.235 estabelecimentos com `cnae_fiscal_secundaria` preenchido produzem 119.193.214 linhas; 100% dos códigos são 7 dígitos numéricos, zero órfãos contra `cnaes`. Sem deduplicação (preserva a forma da fonte), sem `position`, sem JOIN com descrições.
+4. **`socios_quality_flags`** (v1.25.0+, recipeVersion 3 com os sinais enriquecidos; recipeVersion 2 introduziu `socio_id` na correção do issue #78) — tabela estreita, uma linha por sócio, chave `socio_id` (UUID determinístico em `socios.socio_id`). O trio antigo (`cnpj_basico + identificador_de_socio + cnpj_cpf_do_socio`) permanece como colunas de lookup mas não é único: dois sócios PF da mesma empresa podem compartilhar os 6 dígitos visíveis do CPF mascarado. Sinais sem mutação de valor: `representante_is_placeholder`, `pais_lookup_missing`, `qualificacao_socio_lookup_missing`, `qualificacao_representante_lookup_missing` (excluindo `'00'`, que é o placeholder), `pais_enriched_lookup_missing`, `qualificacao_socio_enriched_lookup_missing`, `qualificacao_representante_enriched_lookup_missing`, `faixa_etaria_nao_se_aplica` (`= '0'`). Os sinais enriquecidos comparam contra as tabelas `*_enriched` (depende de `reference_domains_enriched`) e divergem do sinal mensal nos códigos suplementados (`pais` órfãos do SERPRO; `qualificacao` 36, o código legado Gerente-Delegado). Serve como predicate-source para `socios_clean`.
+5. **`socios_clean`** (v1.26.0+) — camada limpa sobre `socios_quality_flags`. Preserva pares cru/limpo para o trio do representante (`representante_legal`, `nome_do_representante`, `qualificacao_do_representante_legal` — nulificados juntos quando `representante_is_placeholder`) e para `faixa_etaria` (nulificado quando `= '0'`). Sem labels, sem joins de descrição, sem novos booleanos. Usa exclusivamente os predicados de `socios_quality_flags` como fonte única de interpretação.
+6. **`socios_detalhe`** — denormalização por sócio, o equivalente de `empresa_detalhe` nesse grão. Chave `socio_id` (UUID determinístico em `socios.socio_id`); o trio antigo não é único (issue #78), por isso não serve de chave. LEFT JOIN com `qualificacoes_socios_enriched` (duas vezes: qualificação do sócio e do representante) e `paises_enriched` para as descrições resolvidas, e com `identificadores_socio` e `faixas_etarias` (de `reference_domain_labels`) para os enums que o pacote mensal entrega só como código. Cada lookup é 1:1 na chave, então a contagem de linhas não muda e código desconhecido fica com `descricao` `NULL`. Sem mutação de valor: placeholders como `qualificacao_do_representante_legal = '00'` e `representante_legal = '***000000**'` ficam crus aqui; nulificá-los é papel de `socios_clean`. Depende de `reference_domains_enriched` e `reference_domain_labels`, aplicadas antes.
+7. **`labels`** — `porte`, `situacao_cadastral`, `identificador_matriz_filial`, `identificador_de_socio` e `faixa_etaria` têm rótulo: a receita `reference_domain_labels` materializa as tabelas estáticas, `empresa_detalhe` expõe as três primeiras e `socios_detalhe` as duas de sócio. Não fica enum oficial sem coluna de descrição prevista.
+8. **`booleanos`** — colunas convenientes como `is_ativa`, `is_matriz`, `is_optante_simples_atual`. Cada uma deve documentar a regra usada.
+
+`empresas_busca_nome` e `empresas_busca_nome_counts` são receitas opcionais disponíveis para busca de matrizes ativas por nome e totais por UF, município e CNAE. Consulte [o catálogo](../recipes/README.md) para dependências e execução; elas não fazem parte da carga padrão.

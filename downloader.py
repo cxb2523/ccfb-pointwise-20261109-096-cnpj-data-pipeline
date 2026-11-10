@@ -1,0 +1,664 @@
+"""Download and extract CNPJ data files from Receita Federal."""
+
+import logging
+import os
+import re
+import time
+import zipfile
+from collections.abc import Callable, Generator, Iterator, Mapping
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from threading import Condition, Lock
+from time import monotonic
+from xml.etree import ElementTree
+
+import requests
+import urllib3.exceptions
+from tqdm import tqdm
+
+from config import Config
+from file_types import CNPJ_FILE_PATTERNS as CNPJ_FILE_PATTERNS
+from file_types import REFERENCE_FILES
+
+logger = logging.getLogger(__name__)
+
+# WebDAV XML namespace
+DAV_NS = {"d": "DAV:"}
+CONTENT_RANGE_RE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
+UNSATISFIED_CONTENT_RANGE_RE = re.compile(r"bytes \*/(\d+)")
+
+
+class DownloadIncompleteError(RuntimeError):
+    """Raised when a response ends before the advertised ZIP size is reached."""
+
+
+class DownloadStalledError(DownloadIncompleteError):
+    """Raised when a download stream stops yielding bytes past the stall timeout."""
+
+
+# Ceiling for the exponential no-progress retry backoff in _download_zip.
+MAX_RETRY_BACKOFF_SECONDS = 120
+
+
+@dataclass(frozen=True)
+class ConcurrencyDegradation:
+    """A one-way adaptive concurrency change triggered by cumulative stalls."""
+
+    stall_count: int
+    previous_concurrency: int
+    new_concurrency: int
+
+
+class AdaptiveDownloadConcurrency:
+    """Track stream stalls and reduce download concurrency for the current run."""
+
+    def __init__(self, initial_concurrency: int, stall_degrade_threshold: int):
+        self._current_concurrency = initial_concurrency
+        self._stall_degrade_threshold = max(1, stall_degrade_threshold)
+        self._next_degrade_at = self._stall_degrade_threshold
+        self._stall_count = 0
+        self._lock = Lock()
+        self._permits = Condition(self._lock)
+        self._active_streams = 0
+
+    @property
+    def current_concurrency(self) -> int:
+        with self._lock:
+            return self._current_concurrency
+
+    @contextmanager
+    def stream_permit(self) -> Generator[None, None, None]:
+        """Gate one HTTP attempt (connect + stream) on the CURRENT concurrency.
+        _download_parallel only limits how many file downloads are submitted;
+        files already in flight when concurrency degrades would otherwise keep
+        reconnecting in parallel on every retry - observed live 2026-07-09 as
+        a 4-wide reconnect storm after degradation to 1, which Receita answered
+        with connect timeouts until the retry budget died. Every attempt must
+        hold a permit, so degradation serializes retries too."""
+        with self._permits:
+            while self._active_streams >= self._current_concurrency:
+                self._permits.wait()
+            self._active_streams += 1
+        try:
+            yield
+        finally:
+            with self._permits:
+                self._active_streams -= 1
+                self._permits.notify_all()
+
+    @property
+    def stall_count(self) -> int:
+        with self._lock:
+            return self._stall_count
+
+    def record_stall(self) -> ConcurrencyDegradation | None:
+        degradation: ConcurrencyDegradation | None = None
+        with self._lock:
+            self._stall_count += 1
+            if self._stall_count >= self._next_degrade_at:
+                new_concurrency = self._degraded_concurrency(self._current_concurrency)
+                if new_concurrency < self._current_concurrency:
+                    degradation = ConcurrencyDegradation(
+                        stall_count=self._stall_count,
+                        previous_concurrency=self._current_concurrency,
+                        new_concurrency=new_concurrency,
+                    )
+                    self._current_concurrency = new_concurrency
+                self._next_degrade_at += self._stall_degrade_threshold
+
+        if degradation is not None:
+            logger.warning(
+                f"{degradation.stall_count} stalls at concurrency {degradation.previous_concurrency}, "
+                f"degrading to {degradation.new_concurrency} for the rest of the run"
+            )
+
+        return degradation
+
+    @staticmethod
+    def _degraded_concurrency(current_concurrency: int) -> int:
+        if current_concurrency > 2:
+            return 2
+        if current_concurrency > 1:
+            return 1
+        return current_concurrency
+
+
+class Downloader:
+    """Download and extract CNPJ data files with parallel support."""
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.temp_path = Path(config.temp_dir)
+        self.temp_path.mkdir(exist_ok=True)
+        self.auth = (config.share_token, "")
+        self._owned_paths: set[Path] = set()
+        # One limiter per run: every download path, including PROCESS_WORKERS
+        # threads calling download_file, shares DOWNLOAD_WORKERS and its backoff.
+        self._adaptive = AdaptiveDownloadConcurrency(config.download_workers, config.stall_degrade_threshold)
+
+    def _propfind(self, path: str = "") -> ElementTree.Element:
+        """Execute a WebDAV PROPFIND request and return parsed XML."""
+        url = f"{self.config.base_url}/{path}".rstrip("/") + "/"
+        response = requests.request(
+            "PROPFIND",
+            url,
+            auth=self.auth,
+            headers={"Depth": "1"},
+            timeout=(self.config.connect_timeout, self.config.read_timeout),
+        )
+        response.raise_for_status()
+        return ElementTree.fromstring(response.content)
+
+    def get_available_directories(self) -> list[str]:
+        """Get all available data directories from Receita Federal."""
+        root = self._propfind()
+
+        directories: list[str] = []
+        for response in root.findall("d:response", DAV_NS):
+            href_element = response.find("d:href", DAV_NS)
+            if href_element is None or href_element.text is None:
+                raise ValueError("WebDAV response is missing href text")
+            href = href_element.text
+            # Match YYYY-MM directory pattern from href path
+            match = re.search(r"(\d{4}-\d{2})/?$", href)
+            if match:
+                directories.append(match.group(1))
+
+        if not directories:
+            raise ValueError("No data directories found")
+
+        return sorted(directories)
+
+    def get_latest_directory(self) -> str:
+        """Get the latest data directory from Receita Federal."""
+        return self.get_available_directories()[-1]
+
+    def get_directory_files(self, directory: str) -> list[str]:
+        """Get list of ZIP files in a directory."""
+        root = self._propfind(directory)
+
+        files: list[str] = []
+        for response in root.findall("d:response", DAV_NS):
+            href_element = response.find("d:href", DAV_NS)
+            if href_element is None or href_element.text is None:
+                raise ValueError("WebDAV response is missing href text")
+            href = href_element.text
+            # Extract .zip filenames from href
+            match = re.search(r"/([^/]+\.zip)$", href, re.IGNORECASE)
+            if match:
+                files.append(match.group(1))
+
+        return files
+
+    def download_file(self, directory: str, filename: str) -> list[Path]:
+        """Download and extract a single ZIP file. Returns list of extracted CSV paths."""
+        self._prune_stale_partials(directory)
+        return self._download_and_extract(directory, filename)
+
+    def download_files(self, directory: str, files: list[str]) -> Generator[tuple[Path, str]]:
+        """Yield individual CSV paths with their ZIP filenames."""
+        for paths, filename in self.download_archives(directory, files):
+            for path in paths:
+                yield path, filename
+
+    def download_archives(self, directory: str, files: list[str]) -> Generator[tuple[list[Path], str]]:
+        """Yield all CSV paths from each completed ZIP, keeping archive boundaries."""
+        if not files:
+            return
+
+        self._prune_stale_partials(directory)
+
+        # Split into reference and data files
+        reference_files = [f for f in files if f in REFERENCE_FILES]
+        data_files = [f for f in files if f not in REFERENCE_FILES]
+
+        # Process reference files first (sequentially)
+        for filename in reference_files:
+            yield self._download_and_extract(directory, filename), filename
+
+        # Process data files in parallel
+        if data_files:
+            yield from self._download_parallel(directory, data_files)
+
+    def _download_parallel(self, directory: str, files: list[str]) -> Iterator[tuple[list[Path], str]]:
+        """Download data files in parallel using ThreadPoolExecutor."""
+        with ThreadPoolExecutor(max_workers=self.config.download_workers) as executor:
+            next_file_index = 0
+            future_to_filename: dict[Future[list[Path]], str] = {}
+
+            def submit_until_limit() -> None:
+                nonlocal next_file_index
+                while next_file_index < len(files) and len(future_to_filename) < self._adaptive.current_concurrency:
+                    filename = files[next_file_index]
+                    next_file_index += 1
+                    future = executor.submit(self._download_and_extract, directory, filename)
+                    future_to_filename[future] = filename
+
+            submit_until_limit()
+            while future_to_filename:
+                completed_futures, _ = wait(future_to_filename, return_when=FIRST_COMPLETED)
+                completed_downloads: list[tuple[str, list[Path]]] = []
+                for future in completed_futures:
+                    filename = future_to_filename.pop(future)
+                    extracted_files = future.result()
+                    completed_downloads.append((filename, extracted_files))
+                submit_until_limit()
+
+                for filename, extracted_files in completed_downloads:
+                    yield extracted_files, filename
+
+    def _download_and_extract(
+        self,
+        directory: str,
+        filename: str,
+    ) -> list[Path]:
+        """Download a single ZIP file and extract CSV files."""
+        url = f"{self.config.base_url}/{directory}/{filename}"
+        zip_path = self.temp_path / f"{self._directory_slug(directory)}.{filename}"
+        self._owned_paths.add(zip_path)
+
+        # Skip download if keeping files and valid ZIP already exists
+        # Use info logging when tqdm is disabled (e.g., Docker, CI)
+        log = logger.info if os.environ.get("TQDM_DISABLE") else logger.debug
+
+        if self.config.keep_files and zip_path.exists() and self._cached_zip_is_valid(zip_path):
+            log(f"Using cached: {filename}")
+        else:
+            self._download_zip(url, directory, filename, zip_path, log)
+
+        # Extract CSV files
+        extracted_files: list[Path] = []
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                for info in zip_ref.infolist():
+                    if info.is_dir():
+                        continue
+                    member = info.filename
+                    member_upper = member.upper()
+                    is_cnpj_file = any(pattern in member_upper for pattern in CNPJ_FILE_PATTERNS)
+
+                    if is_cnpj_file:
+                        member_path = Path(member)
+                        extract_path = self.temp_path / member_path
+                        if (
+                            member_path.is_absolute()
+                            or ".." in member_path.parts
+                            or not extract_path.resolve().is_relative_to(self.temp_path.resolve())
+                            or any(
+                                (self.temp_path / Path(*member_path.parts[:index])).is_symlink()
+                                for index in range(1, len(member_path.parts) + 1)
+                            )
+                        ):
+                            raise ValueError(f"Unsafe archive member: {member}")
+                        self._owned_paths.add(extract_path)
+                        zip_ref.extract(member, self.temp_path)
+                        extracted_files.append(extract_path)
+                        logger.debug(f"Extracted: {member}")
+
+            if not extracted_files:
+                zip_path.unlink(missing_ok=True)
+                raise ValueError(f"No recognized source files in {directory}/{filename}")
+
+        finally:
+            # Cleanup ZIP file unless keeping files
+            if zip_path.exists() and not self.config.keep_files:
+                zip_path.unlink()
+
+        return extracted_files
+
+    @staticmethod
+    def _directory_slug(directory: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_-]", "_", directory) or "root"
+
+    def _prune_stale_partials(self, directory: str) -> None:
+        """Delete .part resume files left over from other source directories.
+        cleanup() deliberately preserves partials so a failed run can resume,
+        but a partial from another month can never be resumed (its slug will
+        never match) - without pruning, every failed historical attempt would
+        retain multi-GB files forever."""
+        suffix = f".{self._directory_slug(directory)}.part"
+        # Only touch downloader-owned resume files ({name}.zip.{slug}.part):
+        # TEMP_DIR may be shared, and unrelated *.part files are not ours to delete.
+        for part_file in self.temp_path.glob("*.zip.*.part"):
+            if not part_file.name.endswith(suffix):
+                logger.info(f"Removing stale partial from another source directory: {part_file.name}")
+                part_file.unlink(missing_ok=True)
+
+    def _download_zip(
+        self,
+        url: str,
+        directory: str,
+        filename: str,
+        zip_path: Path,
+        log: Callable[[str], None],
+    ) -> None:
+        """Download a ZIP through a resumable .part file and validate it."""
+        # The .part name carries the source directory (month): CNPJ file names
+        # repeat across monthly directories, and resuming (or 416-finalizing)
+        # a partial that belongs to another month would corrupt the dataset.
+        part_path = zip_path.with_name(f"{filename}.{self._directory_slug(directory)}.part")
+
+        if zip_path.exists():
+            zip_path.unlink()
+
+        # retry_attempts bounds CONSECUTIVE failures without forward progress,
+        # not total failures: a stall that grew the .part file is the resume
+        # path working, and Receita routinely stalls every few dozen MB, so a
+        # large file can accumulate many productive stalls. Counting those
+        # against a fixed budget makes big files structurally undownloadable.
+        # Only a retry that adds no bytes (server wedged, restart-from-zero)
+        # burns an attempt.
+        progress_marker = part_path.stat().st_size if part_path.exists() else 0
+        failures_without_progress = 0
+        while True:
+            try:
+                log(f"Downloading {filename}...")
+                with self._adaptive.stream_permit():
+                    try:
+                        self._download_zip_once(url, filename, zip_path, part_path)
+                    except (DownloadStalledError, requests.exceptions.ConnectTimeout):
+                        # ConnectTimeout counts as server pressure alongside
+                        # stalls: a server that stops accepting connections
+                        # after stalling streams is telling us the same thing.
+                        # Record while the permit is still held, so waiters
+                        # wake to the degraded limit rather than racing one
+                        # more attempt through at the old concurrency.
+                        self._adaptive.record_stall()
+                        raise
+                return
+            except Exception as e:
+                if zip_path.exists():
+                    zip_path.unlink()
+
+                if not isinstance(e, DownloadStalledError):
+                    logger.warning(f"Download attempt failed: {e}")
+
+                part_size = part_path.stat().st_size if part_path.exists() else 0
+                if part_size > progress_marker:
+                    progress_marker = part_size
+                    failures_without_progress = 0
+                else:
+                    failures_without_progress += 1
+                if failures_without_progress >= self.config.retry_attempts:
+                    raise
+                # Exponential backoff on consecutive no-progress failures: a
+                # fixed delay re-hammers a refusing server on a tight cadence
+                # (observed as connect-timeout loops every ~35s); progress
+                # resets the backoff along with the failure budget.
+                backoff = self.config.retry_delay * (2 ** max(0, failures_without_progress - 1))
+                time.sleep(min(backoff, MAX_RETRY_BACKOFF_SECONDS))
+
+    def _download_zip_once(self, url: str, filename: str, zip_path: Path, part_path: Path) -> None:
+        offset = part_path.stat().st_size if part_path.exists() else 0
+        headers = {"Accept-Encoding": "identity"}
+        if offset:
+            headers["Range"] = f"bytes={offset}-"
+
+        try:
+            response = requests.get(
+                url,
+                auth=self.auth,
+                headers=headers,
+                stream=True,
+                timeout=(self.config.connect_timeout, self.config.stall_timeout),
+            )
+        except requests.exceptions.ReadTimeout as exc:
+            raise self._stalled_error(filename, offset) from exc
+
+        status_code = self._status_code(response)
+        if offset and status_code == 416:
+            expected_total = self._unsatisfied_range_total(response.headers)
+            if expected_total == offset:
+                logger.info(f"Completing previously downloaded partial ZIP: {filename}")
+                part_path.replace(zip_path)
+                self._validate_zip_file(zip_path)
+                return
+
+            reason = (
+                "server did not report the remote size"
+                if expected_total is None
+                else f"local size {offset} differs from remote size {expected_total}"
+            )
+            logger.info(f"Discarding partial download for {filename}: {reason}")
+            part_path.unlink(missing_ok=True)
+            raise DownloadIncompleteError(f"Cannot resume {filename}: {reason}")
+
+        response.raise_for_status()
+
+        expected_total, write_offset = self._prepare_download_response(response, filename, part_path, offset)
+
+        tqdm_disabled = bool(os.environ.get("TQDM_DISABLE"))
+        progress_log_interval = self.config.progress_log_interval if tqdm_disabled else 0
+        downloaded_bytes = write_offset
+        last_log_at = monotonic()
+        last_log_bytes = downloaded_bytes
+        last_byte_at = last_log_at
+
+        with tqdm(
+            total=expected_total,
+            initial=write_offset,
+            unit="B",
+            unit_scale=True,
+            desc=f"Downloading {filename}",
+            leave=False,
+            disable=tqdm_disabled,
+        ) as pbar:
+            with part_path.open("ab") as f:
+                try:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        now = monotonic()
+                        if not chunk:
+                            # Keep-alive chunks carry no data; only here can
+                            # elapsed time mean a stall. A non-empty chunk is
+                            # progress by definition, however slowly it came -
+                            # the socket read timeout is the stall authority.
+                            if now - last_byte_at > self.config.stall_timeout:
+                                raise self._stalled_error(filename, downloaded_bytes)
+                            continue
+
+                        chunk_size = len(chunk)
+                        f.write(chunk)
+                        downloaded_bytes += chunk_size
+                        last_byte_at = now
+                        pbar.update(chunk_size)
+
+                        if progress_log_interval and now - last_log_at >= progress_log_interval:
+                            elapsed = now - last_log_at
+                            bytes_since_last_log = downloaded_bytes - last_log_bytes
+                            rate = bytes_since_last_log / elapsed if elapsed > 0 else 0
+                            percent = downloaded_bytes / expected_total * 100 if expected_total else 0.0
+                            eta = "unknown" if rate <= 0 else f"{(expected_total - downloaded_bytes) / rate:.1f}s"
+                            logger.info(
+                                f"{filename} progress: {downloaded_bytes}/{expected_total} bytes "
+                                f"({percent:.1f}%), {rate:.1f} B/s, ETA {eta}"
+                            )
+                            last_log_at = now
+                            last_log_bytes = downloaded_bytes
+                except requests.exceptions.Timeout as exc:
+                    raise self._stalled_error(filename, downloaded_bytes) from exc
+                except requests.exceptions.ConnectionError as exc:
+                    if self._is_read_timeout(exc):
+                        raise self._stalled_error(filename, downloaded_bytes) from exc
+                    raise
+
+        current_size = part_path.stat().st_size
+        if current_size > expected_total:
+            part_path.unlink(missing_ok=True)
+            raise DownloadIncompleteError(f"Downloaded {current_size} bytes for {filename}, expected {expected_total}")
+
+        if current_size != expected_total:
+            raise DownloadIncompleteError(f"Incomplete download for {filename}: {current_size}/{expected_total} bytes")
+
+        part_path.replace(zip_path)
+        self._validate_zip_file(zip_path)
+
+    def _stalled_error(self, filename: str, resume_offset: int) -> DownloadStalledError:
+        message = f"{filename} stalled: no bytes for {self.config.stall_timeout}s, resuming from offset {resume_offset}"
+        logger.warning(message)
+        return DownloadStalledError(message)
+
+    @staticmethod
+    def _is_read_timeout(exc: requests.exceptions.ConnectionError) -> bool:
+        """True when a ConnectionError is a read timeout in disguise.
+        requests' iter_content re-raises urllib3's ReadTimeoutError as
+        ConnectionError(e), so the typed evidence lives in the args and the
+        exception chain; the string match stays as a last-resort fallback."""
+        seen: set[int] = set()
+        stack: list[BaseException] = [exc]
+        while stack:
+            current = stack.pop()
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            if isinstance(current, (urllib3.exceptions.ReadTimeoutError, TimeoutError)):
+                return True
+            stack.extend(arg for arg in current.args if isinstance(arg, BaseException))
+            for linked in (current.__cause__, current.__context__):
+                if linked is not None:
+                    stack.append(linked)
+        return "read timed out" in str(exc).lower()
+
+    def _prepare_download_response(
+        self,
+        response: requests.Response,
+        filename: str,
+        part_path: Path,
+        offset: int,
+    ) -> tuple[int, int]:
+        status_code = self._status_code(response)
+
+        if offset and status_code == 200:
+            logger.info(f"Server ignored Range for {filename}; discarding partial download and restarting from byte 0")
+            part_path.unlink(missing_ok=True)
+            return self._required_content_length(response.headers, filename), 0
+
+        if status_code == 206:
+            range_start, range_end, total_size = self._required_content_range(response.headers, filename)
+            if range_start != offset:
+                logger.info(
+                    f"Discarding partial download for {filename}: server resumed at byte {range_start}, "
+                    f"expected {offset}"
+                )
+                part_path.unlink(missing_ok=True)
+                raise DownloadIncompleteError(
+                    f"Cannot resume {filename}: server resumed at byte {range_start}, expected {offset}"
+                )
+
+            if total_size < offset:
+                logger.info(
+                    f"Discarding partial download for {filename}: local size {offset} exceeds remote size {total_size}"
+                )
+                part_path.unlink(missing_ok=True)
+                raise DownloadIncompleteError(
+                    f"Cannot resume {filename}: local size {offset} exceeds remote size {total_size}"
+                )
+
+            content_length = self._content_length(response.headers, filename, required=False)
+            range_length = range_end - range_start + 1
+            if content_length is not None and content_length != range_length:
+                raise DownloadIncompleteError(
+                    f"Content-Length mismatch for {filename}: {content_length} bytes for range of {range_length}"
+                )
+
+            return total_size, offset
+
+        if offset:
+            raise DownloadIncompleteError(f"Cannot resume {filename}: server returned HTTP {status_code}")
+
+        return self._required_content_length(response.headers, filename), 0
+
+    def _validate_zip_file(self, zip_path: Path) -> None:
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            bad_member = zip_ref.testzip()
+
+        if bad_member is not None:
+            raise zipfile.BadZipFile(f"Corrupt ZIP member: {bad_member}")
+
+    def _required_content_length(self, headers: Mapping[str, str], filename: str) -> int:
+        content_length = self._content_length(headers, filename, required=True)
+        if content_length is None:  # pragma: no cover - required=True already raised
+            raise DownloadIncompleteError(f"Missing Content-Length for {filename}")
+        return content_length
+
+    def _content_length(self, headers: Mapping[str, str], filename: str, required: bool) -> int | None:
+        raw_content_length = self._header(headers, "Content-Length")
+        if raw_content_length is None:
+            if required:
+                raise DownloadIncompleteError(f"Missing Content-Length for {filename}")
+            return None
+
+        try:
+            return int(raw_content_length)
+        except ValueError as exc:
+            raise DownloadIncompleteError(f"Invalid Content-Length for {filename}: {raw_content_length}") from exc
+
+    def _required_content_range(self, headers: Mapping[str, str], filename: str) -> tuple[int, int, int]:
+        raw_content_range = self._header(headers, "Content-Range")
+        if raw_content_range is None:
+            raise DownloadIncompleteError(f"Missing Content-Range for resumed download of {filename}")
+
+        match = CONTENT_RANGE_RE.fullmatch(raw_content_range.strip())
+        if not match:
+            raise DownloadIncompleteError(f"Invalid Content-Range for {filename}: {raw_content_range}")
+
+        range_start = int(match.group(1))
+        range_end = int(match.group(2))
+        total_size = int(match.group(3))
+
+        if range_end < range_start:
+            raise DownloadIncompleteError(f"Invalid Content-Range for {filename}: {raw_content_range}")
+
+        return range_start, range_end, total_size
+
+    def _unsatisfied_range_total(self, headers: Mapping[str, str]) -> int | None:
+        raw_content_range = self._header(headers, "Content-Range")
+        if raw_content_range is None:
+            return None
+
+        match = UNSATISFIED_CONTENT_RANGE_RE.fullmatch(raw_content_range.strip())
+        if not match:
+            return None
+
+        return int(match.group(1))
+
+    @staticmethod
+    def _header(headers: Mapping[str, str], name: str) -> str | None:
+        for header_name, value in headers.items():
+            if header_name.lower() == name.lower():
+                return value
+        return None
+
+    @staticmethod
+    def _status_code(response: requests.Response) -> int:
+        status_code = getattr(response, "status_code", 200)
+        return status_code if isinstance(status_code, int) else 200
+
+    def _cached_zip_is_valid(self, zip_path: Path) -> bool:
+        """CRC-validate a cached ZIP; delete it when corrupt so it is re-downloaded."""
+        try:
+            self._validate_zip_file(zip_path)
+        except (zipfile.BadZipFile, OSError) as exc:
+            logger.warning(f"Cached ZIP {zip_path.name} is invalid ({exc}); re-downloading")
+            zip_path.unlink(missing_ok=True)
+            return False
+        return True
+
+    def cleanup(self):
+        """Remove this instance's ZIPs and extracted files; preserve unrelated files.
+
+        Files orphaned by a killed process are not swept automatically.
+
+        cleanup() runs in main's finally block, so it also executes after a
+        failed run - deleting partials there would forfeit cross-run resume,
+        which is the whole point of the .part protocol. Stale partials are
+        reconciled per-file on the next download (resumed or discarded).
+        """
+        if self.config.keep_files:
+            return
+
+        for file in self._owned_paths:
+            if file.is_file() or file.is_symlink():
+                file.unlink(missing_ok=True)
+        self._owned_paths.clear()

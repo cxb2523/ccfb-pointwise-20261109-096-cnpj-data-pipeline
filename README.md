@@ -1,0 +1,262 @@
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/2ab351f0-a940-4b55-a875-d5773ddf0515" width="80" height="80" alt="cnpj.chat">
+</p>
+
+<h1 align="center">CNPJ Data Pipeline</h1>
+
+<p align="center">
+  Baixa e processa dados de empresas brasileiras da Receita Federal para PostgreSQL.
+  <br>
+  Parte do <a href="https://cnpj.chat">cnpj.chat</a> — dados públicos de empresas, acessíveis para todos.
+</p>
+
+<p align="center">
+  <a href="https://github.com/caiopizzol/cnpj-data-pipeline/releases"><img src="https://img.shields.io/github/v/release/caiopizzol/cnpj-data-pipeline" alt="Release"></a>
+  <a href="https://www.python.org"><img src="https://img.shields.io/badge/python-3.11+-blue" alt="Python"></a>
+  <a href="https://github.com/astral-sh/ruff"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json" alt="Ruff"></a>
+  <a href="https://codecov.io/gh/caiopizzol/cnpj-data-pipeline"><img src="https://codecov.io/gh/caiopizzol/cnpj-data-pipeline/graph/badge.svg" alt="codecov"></a>
+</p>
+
+> [!IMPORTANT]
+> **Desde v1.3.2** — _A Receita Federal migrou os arquivos CNPJ para um novo repositório Nextcloud. Esta versão já suporta a nova URL e realiza downloads via WebDAV automaticamente. Nenhuma configuração adicional necessária._
+
+> [!IMPORTANT]
+> **Desde v1.35.0** — _Suporte ao CNPJ alfanumérico da Receita Federal, previsto para novas inscrições a partir de julho de 2026. `cnpj_basico` e `cnpj_ordem` aceitam `0-9` e `A-Z`; `cnpj_dv` continua numérico. CNPJs numéricos existentes seguem compatíveis sem mudança._
+
+> [!TIP]
+> **Novo** — _Estratégia de carga configurável. Use `LOADING_STRATEGY=replace` para substituir os dados (TRUNCATE + UPSERT) ou `upsert` (default) para manter disponibilidade durante a carga._
+
+## Requisitos
+
+- [uv](https://docs.astral.sh/uv/) — gerencia pacotes e versões do Python. Substitui pip e virtualenv
+- [just](https://github.com/casey/just) — roda os comandos do projeto. Substitui Makefile
+- [Docker](https://docs.docker.com/get-docker/) — roda o PostgreSQL sem instalar banco local
+- **Python 3.11+** — `uv` instala automaticamente se necessário
+
+### Instalação
+
+**macOS** (Homebrew):
+```bash
+brew install uv just
+```
+
+**Linux / Windows:** veja a instalação do [uv](https://docs.astral.sh/uv/getting-started/installation/) e do [just](https://github.com/casey/just#installation).
+
+> `uv` e `just` são binários prontos — não precisa de Rust ou compilação.
+
+## Início Rápido
+
+```bash
+cp .env.example .env
+just up      # Iniciar PostgreSQL
+just run     # Processar a competência mais recente uma vez
+```
+
+## Via Docker
+
+Imagem pronta publicada a cada release no GitHub Container Registry. Não precisa clonar o repositório.
+
+```bash
+# Listar meses disponíveis
+docker run --rm ghcr.io/caiopizzol/cnpj-data-pipeline --list
+
+# Processar a competência mais recente uma vez em um Postgres seu
+docker run --rm \
+  -e DATABASE_URL=postgres://user:pass@host:5432/cnpj \
+  ghcr.io/caiopizzol/cnpj-data-pipeline
+
+# Exportar para Parquet (sem banco)
+docker run --rm \
+  -e OUTPUT_FORMAT=parquet \
+  -v $(pwd)/parquet:/app/parquet \
+  ghcr.io/caiopizzol/cnpj-data-pipeline
+```
+
+O schema é aplicado automaticamente na primeira execução. Para rodar com o Postgres do projeto, use `docker compose run --rm pipeline <args>`.
+
+## Comandos
+
+```bash
+just install # Instalar dependências
+just up      # Iniciar PostgreSQL
+just down    # Parar PostgreSQL
+just db      # Entrar no banco (psql)
+just run     # Executar pipeline
+just reset   # Limpar e reiniciar banco
+just lint    # Verificar código
+just format  # Formatar código
+just test    # Rodar testes
+just typecheck # Verificar tipos Python em modo estrito
+just check   # Rodar lint, format, typecheck e testes
+```
+
+`just typecheck` roda o Pyright em modo estrito no código, scripts e testes. Também faz parte de `just check`, do CI e do pre-commit do Lefthook. Erros de tipagem fazem essas verificações falharem. Para ativar os hooks no clone, instale o Lefthook e rode `lefthook install`.
+
+## Uso
+
+```bash
+just run                          # Processar mês mais recente
+just run --list                   # Listar meses disponíveis
+just run --month 2024-11          # Processar mês específico
+just run --month 2024-11 --force  # Reprocessar mês no PostgreSQL
+```
+
+### Atualizações recorrentes
+
+Cada comando executa o pipeline uma vez e encerra. Sem `--month`, ele seleciona a competência mais recente disponível. No PostgreSQL, arquivos já processados são ignorados.
+
+Para manter a base atualizada, configure um cron job ou outro scheduler para executar periodicamente `just run` ou `docker compose run --rm pipeline`. Não use `--force` nas execuções agendadas. Uma execução trava o `TEMP_DIR` até terminar: se o agendador iniciar outra enquanto a anterior ainda roda, a nova sai com erro sem tocar em nada. Execuções que precisam rodar ao mesmo tempo devem usar `TEMP_DIR` diferentes.
+
+## Configuração
+
+```bash
+DATABASE_URL=postgres://postgres:postgres@localhost:5435/cnpj
+BATCH_SIZE=500000
+TEMP_DIR=./temp
+DOWNLOAD_WORKERS=4
+RETRY_ATTEMPTS=3
+RETRY_DELAY=5
+CONNECT_TIMEOUT=30
+READ_TIMEOUT=300
+STALL_TIMEOUT=30
+PROGRESS_LOG_INTERVAL=30
+STALL_DEGRADE_THRESHOLD=3  # Stalls acumulados até reduzir a concorrência
+KEEP_DOWNLOADED_FILES=false
+LOADING_STRATEGY=upsert  # "upsert" ou "replace"
+OUTPUT_FORMAT=postgres   # "postgres" ou "parquet"
+PARQUET_OUTPUT_DIR=./parquet
+PARQUET_TYPED_OUTPUT=false  # Quando true, datas e numéricos saem tipados (Date, Float64, Int32)
+PROCESS_WORKERS=1        # Arquivos do mesmo grupo em paralelo (ex: 4)
+```
+
+### Downloads resilientes
+
+O servidor da Receita costuma travar streams grandes (e recusa conexões
+quando várias baixam em paralelo). Os downloads são retomáveis via arquivo
+`.part`, e as variáveis acima não têm mais o sentido óbvio dos nomes:
+
+- `RETRY_ATTEMPTS` conta **falhas consecutivas sem progresso**, não falhas
+  totais. Qualquer byte novo gravado no `.part` zera o orçamento, então um
+  arquivo grande sobrevive a muitos stalls produtivos.
+- `RETRY_DELAY` é a base de um backoff exponencial (dobra a cada falha sem
+  progresso, teto de 120s), não um atraso fixo.
+- Stalls e connect timeouts repetidos reduzem a concorrência de download
+  (`DOWNLOAD_WORKERS` -> 2 -> 1) a partir de `STALL_DEGRADE_THRESHOLD`, sem
+  voltar a subir na mesma execução.
+- Cada tentativa HTTP (inclusive as retentativas) passa pela concorrência
+  adaptativa, então ao degradar para 1 as retentativas serializam em vez de
+  reconectar em paralelo.
+
+### `DATABASE_URL`: parâmetros libpq
+
+O `DATABASE_URL` é repassado direto ao driver, então qualquer parâmetro suportado pelo libpq funciona via query string. Útil para Postgres gerenciado (Railway, RDS, Supabase, Neon) e para isolar o pipeline em um schema próprio.
+
+Sempre coloque o valor entre aspas no shell: o `&` da query string é metacaractere e, sem aspas, faz o bash colocar o comando em background.
+
+```bash
+# SSL obrigatório
+DATABASE_URL='postgres://user:pass@host:5432/cnpj?sslmode=require'
+
+# Pipeline em schema separado
+DATABASE_URL='postgres://user:pass@host:5432/cnpj?options=-c%20search_path%3Dcnpj'
+
+# Combinado
+DATABASE_URL='postgres://user:pass@host:5432/cnpj?sslmode=require&options=-c%20search_path%3Dcnpj'
+```
+
+Sobre `search_path`: o schema precisa existir antes (`CREATE SCHEMA cnpj;`), o libpq não cria. Se você incluir `public` como fallback (`search_path=cnpj,public`) e o `public` já tiver tabelas do pipeline de uma execução anterior, o bootstrap (`ensure_schema`) detecta as tabelas no `public` e não cria nada no `cnpj`. Para isolamento estrito, deixe só `cnpj` no `search_path`, ou use um banco novo.
+
+### Estratégia de carga (PostgreSQL)
+
+| Estratégia | Comando | Quando usar |
+|------------|---------|-------------|
+| `upsert` | `LOADING_STRATEGY=upsert just run` | Insere registros novos e atualiza existentes. O banco continua acessível durante a carga. |
+| `replace` | `LOADING_STRATEGY=replace just run` | Substitui os dados da competência processada. Faz TRUNCATE antes da carga e aceita chaves repetidas. |
+
+### Formato de saída
+
+| Formato | Comando | Quando usar |
+|---------|---------|-------------|
+| `postgres` | `just run` | Default. Carrega no PostgreSQL. |
+| `parquet` | `OUTPUT_FORMAT=parquet just run` | Exporta direto para Parquet. Sem banco de dados — ideal para DuckDB, Pandas, Spark. |
+
+### Parquet
+
+Com `OUTPUT_FORMAT=parquet`, o pipeline exporta direto para arquivos Parquet com compressão ZSTD. Sem necessidade de PostgreSQL.
+
+```bash
+OUTPUT_FORMAT=parquet just run
+```
+
+Saída (~6GB a partir de ~85GB de CSVs):
+```
+parquet/
+  cnaes.parquet
+  motivos.parquet
+  municipios.parquet
+  naturezas_juridicas.parquet
+  paises.parquet
+  qualificacoes_socios.parquet
+  empresas.parquet
+  estabelecimentos.parquet
+  socios.parquet
+  dados_simples.parquet
+  manifest.json
+```
+
+Consulte com DuckDB:
+```sql
+SELECT * FROM 'parquet/empresas.parquet' WHERE cnpj_basico = '00000000';
+SELECT COUNT(*) FROM 'parquet/estabelecimentos.parquet' WHERE uf = 'SP';
+```
+
+## Schema
+
+> Documentação completa: [docs/data-schema.md](docs/data-schema.md)
+>
+> Sobre normalização e tabelas derivadas: [docs/post-processing.md](docs/post-processing.md) · [docs/data-audit.md](docs/data-audit.md)
+
+```
+EMPRESAS (1) ─── (N) ESTABELECIMENTOS
+         ├─── (N) SOCIOS
+         └─── (1) DADOS_SIMPLES
+```
+
+> [!IMPORTANT]
+> Se você já carregou dados antes da mudança para `socios.socio_id`, recrie `socios` e as receitas derivadas (`socios_quality_flags`, `socios_clean`) para preservar sócios com CPF mascarado ou documento ausente.
+>
+> Veja o passo a passo em [docs/upgrading.md](docs/upgrading.md#sociossocio_id).
+
+## Fonte de Dados
+
+Estes dados são **públicos e oficiais**, disponibilizados pela própria Receita Federal do Brasil.
+
+| | |
+|---|---|
+| **Fonte** | [Portal de Dados Abertos — CNPJ](https://dados.gov.br/dados/conjuntos-dados/cadastro-nacional-da-pessoa-juridica---cnpj) |
+| **Repositório** | [Receita Federal — Nextcloud](https://arquivos.receitafederal.gov.br/index.php/s/YggdBLfdninEJX9) |
+| **Publicação da fonte** | Mensal, pela Receita Federal |
+| **Formato** | CSV (`;` separador, ISO-8859-1) |
+| **Base legal** | [Lei 12.527/2011](https://www.planalto.gov.br/ccivil_03/_ato2011-2014/2011/lei/l12527.htm) (Lei de Acesso à Informação), art. 8° |
+| **Regulamentação** | [Decreto 10.046/2019](https://www.planalto.gov.br/ccivil_03/_ato2019-2022/2019/decreto/D10046.htm) |
+| **Nota Técnica** | [RFB/COCAD n° 47/2024](https://www.gov.br/receitafederal/dados/nota_cocad_no_47_2024.pdf/) (alterada pela [NT 86/2024](https://www.gov.br/receitafederal/dados/nota-cocad-rfb-86-2024.pdf/)) |
+| **Metadados** | [Layout dos arquivos (PDF)](https://www.gov.br/receitafederal/dados/cnpj-metadados.pdf) |
+
+O conjunto de dados CNPJ no Portal de Dados Abertos contém três recursos:
+
+| Recurso | Descrição | Status |
+|---------|-----------|--------|
+| Dicionário de dados | Layout e metadados dos arquivos | Referência |
+| **Inscrições no CNPJ** | Dados cadastrais de empresas, estabelecimentos, sócios e Simples Nacional | **Processado por este pipeline** |
+| Regimes Tributários | Forma de tributação (ECF): Lucro Real, Presumido, Arbitrado, Imunes/Isentas | Ainda não suportado |
+
+A Coordenação-Geral de Gestão de Cadastros e Benefícios Fiscais (Cocad) classifica estes dados como **dados públicos, de livre acesso a qualquer interessado** (NT 47/2024, item 10). CPFs de sócios são mascarados conforme art. 198 da [Lei 5.172/1966](https://www.planalto.gov.br/ccivil_03/leis/l5172compilado.htm) (CTN).
+
+Estes dados **não** são vazados, obtidos ilegalmente, ou protegidos por sigilo fiscal.
+
+## Contribuidores
+
+<a href="https://github.com/caiopizzol"><img src="https://github.com/caiopizzol.png" width="50" height="50" alt="caiopizzol" title="Caio Pizzol" /></a>
+<a href="https://github.com/fabriciopereiradiniz"><img src="https://github.com/fabriciopereiradiniz.png" width="50" height="50" alt="fabriciopereiradiniz" title="Fabrício Pereira Diniz" /></a>
+<a href="https://github.com/dversoza"><img src="https://github.com/dversoza.png" width="50" height="50" alt="dversoza" title="dversoza" /></a>
+<a href="https://github.com/renerlemes"><img src="https://github.com/renerlemes.png" width="50" height="50" alt="renerlemes" title="Rener Lemes" /></a>

@@ -1,0 +1,1271 @@
+"""Tests for main module."""
+
+import errno
+import json
+import sys
+import time
+import zipfile
+from collections.abc import Generator, Iterator
+from pathlib import Path
+from typing import TypeVar
+from unittest.mock import MagicMock, patch
+
+import polars as pl
+import pytest
+
+from config import Config
+from downloader import Downloader
+from main import (
+    get_file_priority,
+    group_files_by_dependency,
+    main,
+    parquet_worker,
+    parse_args,
+    pg_worker,
+    run_lock,
+)
+from parquet_writer import ParquetWriter
+
+T = TypeVar("T")
+
+
+def downloads(items: list[T]) -> Generator[T]:
+    """A download double shaped like the real generator methods, which main() closes."""
+    yield from items
+
+
+@pytest.fixture
+def cfg(tmp_path: Path) -> Config:
+    return Config(
+        database_url="postgresql://test", temp_dir=str(tmp_path), parquet_output_dir=str(tmp_path / "parquet")
+    )
+
+
+class TestGetFilePriority:
+    """Test sorting priority within the configured logical loading order."""
+
+    def test_reference_tables_first(self) -> None:
+        """Reference tables should have lowest priority values (processed first)."""
+        assert get_file_priority("CNAECSV.D51213") < get_file_priority("EMPRECSV.D51213")
+        assert get_file_priority("PAISCSV.D51213") < get_file_priority("ESTABELE.D51213")
+
+    def test_sort_priority_within_loading_order(self) -> None:
+        """Sorting ranks empresas before estabelecimentos before socios; the latter two share a worker group."""
+        empresas = get_file_priority("EMPRECSV.D51213")
+        estabelecimentos = get_file_priority("ESTABELE.D51213")
+        socios = get_file_priority("SOCIOCSV.D51213")
+
+        assert empresas < estabelecimentos
+        assert estabelecimentos < socios
+
+    def test_unknown_file_sorts_last(self) -> None:
+        """Unknown file types should sort after all known types."""
+        assert get_file_priority("UNKNOWN.csv") == 999
+        assert get_file_priority("UNKNOWN.csv") > get_file_priority("SIMPLESCSV.D51213")
+
+
+class TestGroupFilesByDependency:
+    """Test dependency grouping for parallel processing."""
+
+    def test_groups_reference_files(self) -> None:
+        """Reference files should all be in group 0."""
+        files = ["Cnaes.zip", "Motivos.zip", "Paises.zip"]
+        groups = group_files_by_dependency(files)
+        assert len(groups[0]) == 3
+        assert len(groups[1]) == 0
+        assert len(groups[2]) == 0
+
+    def test_groups_by_dependency_level(self) -> None:
+        """Files should be grouped by their logical loading level."""
+        files = ["Cnaes.zip", "Empresas0.zip", "Estabele0.zip", "Socios0.zip"]
+        groups = group_files_by_dependency(files)
+        assert groups[0] == ["Cnaes.zip"]
+        assert groups[1] == ["Empresas0.zip"]
+        assert sorted(groups[2]) == sorted(["Estabele0.zip", "Socios0.zip"])
+
+    def test_multiple_files_same_type(self) -> None:
+        """Multiple files of the same type should be in the same group."""
+        files = ["Empresas0.zip", "Empresas1.zip", "Empresas2.zip"]
+        groups = group_files_by_dependency(files)
+        assert len(groups[1]) == 3
+
+    def test_unknown_files_excluded(self) -> None:
+        """Unknown file types should not appear in any group."""
+        files = ["Unknown.zip", "Cnaes.zip"]
+        groups = group_files_by_dependency(files)
+        assert len(groups[0]) == 1
+        assert all(len(g) == 0 for g in groups[1:])
+
+
+class TestParseArgs:
+    """Test the public command-line arguments."""
+
+    @patch("sys.argv", ["main.py", "--month", "2024-11", "--force"])
+    def test_parses_month_and_force(self) -> None:
+        args = parse_args()
+
+        assert args.list is False
+        assert args.month == "2024-11"
+        assert args.force is True
+
+
+class TestMain:
+    """Test main pipeline orchestration."""
+
+    @patch("main.Downloader")
+    @patch("main.parse_args")
+    def test_list_mode_never_touches_database(self, mock_args: MagicMock, mock_downloader_cls: MagicMock) -> None:
+        """--list should print months and never create a Database."""
+        mock_args.return_value = MagicMock(list=True, month=None, force=False)
+        mock_downloader = MagicMock()
+        mock_downloader.get_available_directories.return_value = ["2024-01", "2024-02"]
+        mock_downloader_cls.return_value = mock_downloader
+
+        with patch("database.Database") as mock_db_cls:
+            main()
+
+            mock_db_cls.assert_not_called()
+
+    @patch("database.Database")
+    @patch("main.Downloader")
+    @patch("main.parse_args")
+    def test_second_run_on_same_temp_dir_exits_untouched(
+        self, mock_args: MagicMock, mock_downloader_cls: MagicMock, mock_db_cls: MagicMock, cfg: Config
+    ) -> None:
+        """A run already holding TEMP_DIR makes a second run exit before touching downloads or the database."""
+        mock_args.return_value = MagicMock(list=False, month=None, force=False)
+        cfg.output_format = "postgres"
+
+        with run_lock(cfg.temp_dir), pytest.raises(SystemExit) as exc_info:
+            main(cfg=cfg)
+
+        assert exc_info.value.code == 1
+        mock_downloader_cls.assert_not_called()
+        mock_db_cls.assert_not_called()
+
+    @pytest.mark.parametrize("locked", [False, True])
+    def test_windows_lock_uses_msvcrt(self, cfg: Config, monkeypatch: pytest.MonkeyPatch, locked: bool) -> None:
+        """On Windows the lock is a non-blocking msvcrt byte lock; a held lock refuses the run."""
+        msvcrt = MagicMock(LK_NBLCK=2)
+        if locked:
+            msvcrt.locking.side_effect = PermissionError("locked")
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setitem(sys.modules, "msvcrt", msvcrt)
+
+        if locked:
+            with pytest.raises(SystemExit), run_lock(cfg.temp_dir):
+                pass
+        else:
+            with run_lock(cfg.temp_dir):
+                pass
+
+        args = msvcrt.locking.call_args.args
+        assert args[1:] == (msvcrt.LK_NBLCK, 1)
+
+    def test_lock_failure_other_than_contention_is_raised(self, cfg: Config, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A filesystem that cannot lock must fail loudly, not report a run that does not exist."""
+        fcntl = MagicMock(LOCK_EX=2, LOCK_NB=4)
+        fcntl.flock.side_effect = OSError(errno.ENOLCK, "No locks available")
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setitem(sys.modules, "fcntl", fcntl)
+
+        with pytest.raises(OSError, match="No locks available"), run_lock(cfg.temp_dir):
+            pass
+
+    @patch("main.Downloader")
+    @patch("main.parse_args")
+    def test_missing_database_url_exits(
+        self, mock_args: MagicMock, mock_downloader_cls: MagicMock, cfg: Config
+    ) -> None:
+        """Missing DATABASE_URL should exit with code 1."""
+        mock_args.return_value = MagicMock(list=False, month=None, force=False)
+        cfg.output_format = "postgres"
+        cfg.database_url = ""
+
+        with pytest.raises(SystemExit) as exc_info:
+            main(cfg=cfg)
+
+        assert exc_info.value.code == 1
+
+    @patch("database.Database")
+    @patch("main.Downloader")
+    @patch("main.parse_args")
+    def test_invalid_month_exits(
+        self, mock_args: MagicMock, mock_downloader_cls: MagicMock, mock_db_cls: MagicMock, cfg: Config
+    ) -> None:
+        """Invalid --month should exit with code 1."""
+        mock_args.return_value = MagicMock(list=False, month="2099-01", force=False)
+        cfg.output_format = "postgres"
+        cfg.database_url = "postgresql://test"
+        mock_downloader = MagicMock()
+        mock_downloader.get_available_directories.return_value = ["2024-01", "2024-02"]
+        mock_downloader_cls.return_value = mock_downloader
+
+        with pytest.raises(SystemExit) as exc_info:
+            main(cfg=cfg)
+
+        assert exc_info.value.code == 1
+
+    @patch("database.Database")
+    @patch("main.Downloader")
+    @patch("main.parse_args")
+    def test_force_clears_processed_files(
+        self, mock_args: MagicMock, mock_downloader_cls: MagicMock, mock_db_cls: MagicMock, cfg: Config
+    ) -> None:
+        """--force should call clear_processed_files before processing."""
+        mock_args.return_value = MagicMock(list=False, month=None, force=True)
+        cfg.output_format = "postgres"
+        cfg.database_url = "postgresql://test"
+        cfg.batch_size = 500000
+        cfg.keep_files = False
+
+        mock_downloader = MagicMock()
+        mock_downloader.get_latest_directory.return_value = "2024-01"
+        mock_downloader.get_directory_files.return_value = ["Cnaes.zip"]
+        mock_downloader.download_archives.return_value = downloads([])
+        mock_downloader_cls.return_value = mock_downloader
+
+        mock_db = MagicMock()
+        mock_db.get_processed_files.return_value = {"Cnaes.zip"}
+        mock_db_cls.return_value = mock_db
+
+        main(cfg=cfg)
+
+        mock_db.clear_processed_files.assert_called_once_with("2024-01")
+
+    @patch("database.Database")
+    @patch("main.Downloader")
+    @patch("main.parse_args")
+    def test_no_pending_files_returns_early(
+        self, mock_args: MagicMock, mock_downloader_cls: MagicMock, mock_db_cls: MagicMock, cfg: Config
+    ) -> None:
+        """When all files are processed, should return without downloading."""
+        mock_args.return_value = MagicMock(list=False, month=None, force=False)
+        cfg.output_format = "postgres"
+        cfg.database_url = "postgresql://test"
+
+        mock_downloader = MagicMock()
+        mock_downloader.get_latest_directory.return_value = "2024-01"
+        mock_downloader.get_directory_files.return_value = ["Cnaes.zip"]
+        mock_downloader_cls.return_value = mock_downloader
+
+        mock_db = MagicMock()
+        mock_db.get_processed_files.return_value = {"Cnaes.zip"}
+        mock_db_cls.return_value = mock_db
+
+        main(cfg=cfg)
+
+        mock_downloader.download_archives.assert_not_called()
+
+    @patch("main.process_file")
+    @patch("database.Database")
+    @patch("main.Downloader")
+    @patch("main.parse_args")
+    def test_mark_processed_failure_skips_explicit_csv_unlink(
+        self,
+        mock_args: MagicMock,
+        mock_downloader_cls: MagicMock,
+        mock_db_cls: MagicMock,
+        mock_process_file: MagicMock,
+        tmp_path: Path,
+        cfg: Config,
+    ) -> None:
+        """A failed mark_processed skips the explicit unlink; cleanup is mocked here."""
+        mock_args.return_value = MagicMock(list=False, month=None, force=False)
+        cfg.output_format = "postgres"
+        cfg.database_url = "postgresql://test"
+        cfg.batch_size = 500000
+        cfg.keep_files = False
+        cfg.process_workers = 1
+        cfg.loading_strategy = "upsert"
+
+        csv_file = tmp_path / "CNAECSV.D51213"
+        csv_file.write_text("data")
+
+        mock_downloader = MagicMock()
+        mock_downloader.get_latest_directory.return_value = "2024-01"
+        mock_downloader.get_directory_files.return_value = ["Cnaes.zip"]
+        mock_downloader.download_archives.return_value = downloads([([csv_file], "Cnaes.zip")])
+        mock_downloader_cls.return_value = mock_downloader
+
+        mock_db = MagicMock()
+        mock_db.get_processed_files.return_value = set()
+        mock_db.mark_processed.side_effect = Exception("DB write failed")
+        mock_db_cls.return_value = mock_db
+
+        mock_process_file.return_value = iter(
+            [
+                (pl.DataFrame({"codigo": ["001"]}), "cnaes", ["codigo"]),
+            ]
+        )
+
+        with pytest.raises(SystemExit):
+            main(cfg=cfg)
+
+        # The explicit unlink was skipped; real downloader cleanup still removes the file.
+        assert csv_file.exists()
+
+    @patch("database.Database")
+    @patch("main.Downloader")
+    @patch("main.parse_args")
+    def test_always_disconnects_and_cleans_up(
+        self, mock_args: MagicMock, mock_downloader_cls: MagicMock, mock_db_cls: MagicMock, cfg: Config
+    ) -> None:
+        """disconnect and cleanup should always be called, even on error."""
+        mock_args.return_value = MagicMock(list=False, month=None, force=False)
+        cfg.output_format = "postgres"
+        cfg.database_url = "postgresql://test"
+
+        mock_downloader = MagicMock()
+        mock_downloader.get_latest_directory.side_effect = Exception("network error")
+        mock_downloader_cls.return_value = mock_downloader
+
+        mock_db = MagicMock()
+        mock_db_cls.return_value = mock_db
+
+        with pytest.raises(SystemExit):
+            main(cfg=cfg)
+
+        mock_db.disconnect.assert_called_once()
+        mock_downloader.cleanup.assert_called_once()
+
+
+class TestParquetOutput:
+    """Test parquet output format path."""
+
+    @patch("main.process_file")
+    @patch("main.Downloader")
+    @patch("main.parse_args")
+    def test_writes_parquet_and_manifest(
+        self,
+        mock_args: MagicMock,
+        mock_downloader_cls: MagicMock,
+        mock_process_file: MagicMock,
+        tmp_path: Path,
+        cfg: Config,
+    ) -> None:
+        """Parquet mode should write parquet files and manifest without touching database."""
+        mock_args.return_value = MagicMock(list=False, month=None, force=False)
+        cfg.output_format = "parquet"
+        cfg.post_file_command = ""
+        cfg.parquet_output_dir = str(tmp_path / "parquet")
+        cfg.batch_size = 500000
+        cfg.keep_files = False
+        cfg.process_workers = 1
+
+        csv_file = tmp_path / "CNAECSV.D51213"
+        csv_file.write_text("data")
+
+        mock_downloader = MagicMock()
+        mock_downloader.get_latest_directory.return_value = "2024-01"
+        mock_downloader.get_directory_files.return_value = ["Cnaes.zip"]
+        mock_downloader.download_files.return_value = downloads([(csv_file, "Cnaes.zip")])
+        mock_downloader_cls.return_value = mock_downloader
+
+        mock_process_file.return_value = iter(
+            [(pl.DataFrame({"codigo": ["001"], "descricao": ["Test"]}), "cnaes", ["codigo", "descricao"])]
+        )
+
+        main(cfg=cfg)
+
+        parquet_dir = tmp_path / "parquet"
+        assert (parquet_dir / "cnaes.parquet").exists()
+        assert (parquet_dir / "manifest.json").exists()
+        assert not csv_file.exists()
+
+    @patch("main.process_file")
+    @patch("main.Downloader")
+    @patch("main.parse_args")
+    def test_does_not_require_database_url(
+        self,
+        mock_args: MagicMock,
+        mock_downloader_cls: MagicMock,
+        mock_process_file: MagicMock,
+        tmp_path: Path,
+        cfg: Config,
+    ) -> None:
+        """Parquet mode should work without DATABASE_URL."""
+        mock_args.return_value = MagicMock(list=False, month=None, force=False)
+        cfg.output_format = "parquet"
+        cfg.post_file_command = ""
+        cfg.database_url = ""
+        cfg.parquet_output_dir = str(tmp_path / "parquet")
+        cfg.batch_size = 500000
+        cfg.keep_files = True
+        cfg.process_workers = 1
+
+        mock_downloader = MagicMock()
+        mock_downloader.get_latest_directory.return_value = "2024-01"
+        mock_downloader.get_directory_files.return_value = ["Cnaes.zip"]
+        mock_downloader.download_files.return_value = downloads([(tmp_path / "CNAECSV.D51213", "Cnaes.zip")])
+        mock_downloader_cls.return_value = mock_downloader
+
+        mock_process_file.return_value = iter([(pl.DataFrame({"codigo": ["001"]}), "cnaes", ["codigo"])])
+
+        main(cfg=cfg)  # Should not raise SystemExit
+
+    @patch("main.process_file")
+    @patch("main.Downloader")
+    @patch("main.parse_args")
+    def test_estabelecimentos_single_file(
+        self,
+        mock_args: MagicMock,
+        mock_downloader_cls: MagicMock,
+        mock_process_file: MagicMock,
+        tmp_path: Path,
+        cfg: Config,
+    ) -> None:
+        """Estabelecimentos should be written to a single file."""
+        mock_args.return_value = MagicMock(list=False, month=None, force=False)
+        cfg.output_format = "parquet"
+        cfg.post_file_command = ""
+        cfg.parquet_output_dir = str(tmp_path / "parquet")
+        cfg.batch_size = 500000
+        cfg.keep_files = True
+        cfg.process_workers = 1
+
+        mock_downloader = MagicMock()
+        mock_downloader.get_latest_directory.return_value = "2024-01"
+        mock_downloader.get_directory_files.return_value = ["Estabele.zip"]
+        mock_downloader.download_files.return_value = (
+            item for item in [(tmp_path / "ESTABELE.D51213", "Estabele.zip")]
+        )
+        mock_downloader_cls.return_value = mock_downloader
+
+        mock_process_file.return_value = iter(
+            [
+                (
+                    pl.DataFrame({"cnpj_basico": ["00000000", "11111111"], "uf": ["SP", "RJ"]}),
+                    "estabelecimentos",
+                    ["cnpj_basico", "uf"],
+                )
+            ]
+        )
+
+        main(cfg=cfg)
+
+        assert (tmp_path / "parquet" / "estabelecimentos.parquet").exists()
+
+    @patch("main.Downloader")
+    @patch("main.parse_args")
+    def test_cleans_up_on_error(
+        self, mock_args: MagicMock, mock_downloader_cls: MagicMock, tmp_path: Path, cfg: Config
+    ) -> None:
+        """Parquet mode should always call downloader.cleanup on error."""
+        mock_args.return_value = MagicMock(list=False, month=None, force=False)
+        cfg.output_format = "parquet"
+        cfg.post_file_command = ""
+        cfg.parquet_output_dir = str(tmp_path / "parquet")
+
+        mock_downloader = MagicMock()
+        mock_downloader.get_latest_directory.side_effect = Exception("network error")
+        mock_downloader_cls.return_value = mock_downloader
+
+        with pytest.raises(SystemExit):
+            main(cfg=cfg)
+
+        mock_downloader.cleanup.assert_called_once()
+
+    @patch("main.subprocess")
+    @patch("main.process_file")
+    @patch("main.Downloader")
+    @patch("main.parse_args")
+    def test_post_file_command_runs_per_table(
+        self,
+        mock_args: MagicMock,
+        mock_downloader_cls: MagicMock,
+        mock_process_file: MagicMock,
+        mock_subprocess: MagicMock,
+        tmp_path: Path,
+        cfg: Config,
+    ) -> None:
+        """POST_FILE_COMMAND should run once per table after all its files are processed."""
+        mock_args.return_value = MagicMock(list=False, month=None, force=False)
+        cfg.output_format = "parquet"
+        cfg.post_file_command = "echo"
+        cfg.parquet_output_dir = str(tmp_path / "parquet")
+        cfg.batch_size = 500000
+        cfg.keep_files = True
+        cfg.process_workers = 1
+
+        csv_file = tmp_path / "CNAECSV.D51213"
+        csv_file.write_text("data")
+
+        mock_downloader = MagicMock()
+        mock_downloader.get_latest_directory.return_value = "2024-01"
+        mock_downloader.get_directory_files.return_value = ["Cnaes.zip"]
+        mock_downloader.download_files.return_value = downloads([(csv_file, "Cnaes.zip")])
+        mock_downloader_cls.return_value = mock_downloader
+
+        mock_process_file.return_value = iter(
+            [(pl.DataFrame({"codigo": ["001"], "descricao": ["Test"]}), "cnaes", ["codigo", "descricao"])]
+        )
+
+        main(cfg=cfg)
+
+        mock_subprocess.run.assert_called_once()
+        call_args = mock_subprocess.run.call_args[0][0]
+        assert call_args[0] == "echo"
+        assert "cnaes.parquet" in call_args[-1]
+
+
+class TestPgWorker:
+    """Test pg_worker function."""
+
+    @patch("database.Database")
+    @patch("main.process_file")
+    def test_downloads_processes_and_marks_file(
+        self, mock_process_file: MagicMock, mock_db_cls: MagicMock, tmp_path: Path
+    ) -> None:
+        """pg_worker should download, process, mark processed, and delete CSV."""
+        csv_file = tmp_path / "CNAECSV.D51213"
+        csv_file.write_text("data")
+
+        mock_downloader = MagicMock()
+        mock_downloader.download_file.return_value = [csv_file]
+
+        mock_db = MagicMock()
+        mock_db_cls.return_value = mock_db
+
+        cfg = Config(database_url="postgresql://test")
+        cfg.database_url = "postgresql://test"
+        cfg.loading_strategy = "upsert"
+        cfg.batch_size = 500000
+        cfg.keep_files = False
+
+        mock_process_file.return_value = iter([(pl.DataFrame({"codigo": ["001"]}), "cnaes", ["codigo"])])
+
+        pg_worker("Cnaes.zip", "2024-01", mock_downloader, cfg)
+
+        mock_db.bulk_upsert.assert_called_once()
+        mock_db.mark_processed.assert_called_once_with("2024-01", "Cnaes.zip")
+        mock_db.disconnect.assert_called_once()
+        assert not csv_file.exists()
+
+    @patch("database.Database")
+    @patch("main.process_file")
+    def test_uses_bulk_insert_for_replace(
+        self, mock_process_file: MagicMock, mock_db_cls: MagicMock, tmp_path: Path
+    ) -> None:
+        """pg_worker should use bulk_insert when loading_strategy is replace."""
+        csv_file = tmp_path / "CNAECSV.D51213"
+        csv_file.write_text("data")
+
+        mock_downloader = MagicMock()
+        mock_downloader.download_file.return_value = [csv_file]
+
+        mock_db = MagicMock()
+        mock_db_cls.return_value = mock_db
+
+        cfg = Config(database_url="postgresql://test")
+        cfg.database_url = "postgresql://test"
+        cfg.loading_strategy = "replace"
+        cfg.batch_size = 500000
+        cfg.keep_files = False
+
+        mock_process_file.return_value = iter([(pl.DataFrame({"codigo": ["001"]}), "cnaes", ["codigo"])])
+
+        pg_worker("Cnaes.zip", "2024-01", mock_downloader, cfg)
+
+        mock_db.bulk_insert.assert_called_once()
+        mock_db.bulk_upsert.assert_not_called()
+
+    @patch("database.Database")
+    @patch("main.process_file")
+    def test_passes_pre_truncated_to_database(
+        self, mock_process_file: MagicMock, mock_db_cls: MagicMock, tmp_path: Path
+    ) -> None:
+        """pg_worker should pass pre_truncated to Database constructor."""
+        csv_file = tmp_path / "CNAECSV.D51213"
+        csv_file.write_text("data")
+
+        mock_downloader = MagicMock()
+        mock_downloader.download_file.return_value = [csv_file]
+
+        mock_db = MagicMock()
+        mock_db_cls.return_value = mock_db
+
+        cfg = Config(database_url="postgresql://test")
+        cfg.database_url = "postgresql://test"
+        cfg.loading_strategy = "replace"
+        cfg.batch_size = 500000
+        cfg.keep_files = False
+        cfg.retry_attempts = 3
+        cfg.retry_delay = 5
+
+        mock_process_file.return_value = iter([(pl.DataFrame({"codigo": ["001"]}), "cnaes", ["codigo"])])
+
+        pg_worker("Cnaes.zip", "2024-01", mock_downloader, cfg, pre_truncated={"cnaes"})
+
+        mock_db_cls.assert_called_once_with("postgresql://test", pre_truncated={"cnaes"}, retry_attempts=3)
+
+    @patch("database.Database")
+    def test_disconnects_on_error(self, mock_db_cls: MagicMock) -> None:
+        """pg_worker should always call db.disconnect(), even on error."""
+        mock_downloader = MagicMock()
+        mock_downloader.download_file.side_effect = Exception("download failed")
+
+        mock_db = MagicMock()
+        mock_db_cls.return_value = mock_db
+
+        cfg = Config(database_url="postgresql://test")
+        cfg.database_url = "postgresql://test"
+
+        with pytest.raises(Exception, match="download failed"):
+            pg_worker("Cnaes.zip", "2024-01", mock_downloader, cfg)
+
+        mock_db.disconnect.assert_called_once()
+
+
+class TestParquetWorker:
+    """Test parquet_worker function."""
+
+    @patch("main.process_file")
+    def test_downloads_and_writes_batches(self, mock_process_file: MagicMock, tmp_path: Path) -> None:
+        """parquet_worker should download, process, and write to parquet."""
+        csv_file = tmp_path / "CNAECSV.D51213"
+        csv_file.write_text("data")
+
+        mock_downloader = MagicMock()
+        mock_downloader.download_file.return_value = [csv_file]
+        mock_parquet = MagicMock()
+
+        cfg = Config(database_url="postgresql://test")
+        cfg.batch_size = 500000
+        cfg.keep_files = False
+
+        mock_process_file.return_value = iter([(pl.DataFrame({"codigo": ["001"]}), "cnaes", ["codigo"])])
+
+        parquet_worker("Cnaes.zip", "2024-01", mock_downloader, mock_parquet, cfg)
+
+        mock_parquet.write_batch.assert_called_once()
+        assert not csv_file.exists()
+
+    @patch("main.process_file")
+    def test_keeps_file_when_configured(self, mock_process_file: MagicMock, tmp_path: Path) -> None:
+        """parquet_worker should not delete CSV when keep_files is True."""
+        csv_file = tmp_path / "CNAECSV.D51213"
+        csv_file.write_text("data")
+
+        mock_downloader = MagicMock()
+        mock_downloader.download_file.return_value = [csv_file]
+        mock_parquet = MagicMock()
+
+        cfg = Config(database_url="postgresql://test")
+        cfg.batch_size = 500000
+        cfg.keep_files = True
+
+        mock_process_file.return_value = iter([(pl.DataFrame({"codigo": ["001"]}), "cnaes", ["codigo"])])
+
+        parquet_worker("Cnaes.zip", "2024-01", mock_downloader, mock_parquet, cfg)
+
+        assert csv_file.exists()
+
+
+class TestParallelProcessing:
+    """Test workers > 1 code paths."""
+
+    @patch("main.process_file")
+    @patch("main.Downloader")
+    @patch("main.parse_args")
+    def test_parquet_parallel_produces_output(
+        self,
+        mock_args: MagicMock,
+        mock_downloader_cls: MagicMock,
+        mock_process_file: MagicMock,
+        tmp_path: Path,
+        cfg: Config,
+    ) -> None:
+        """With workers > 1 in parquet mode, files should still be processed correctly."""
+        mock_args.return_value = MagicMock(list=False, month=None, force=False)
+        cfg.output_format = "parquet"
+        cfg.post_file_command = ""
+        cfg.parquet_output_dir = str(tmp_path / "parquet")
+        cfg.batch_size = 500000
+        cfg.keep_files = False
+        cfg.process_workers = 2
+
+        csv_file = tmp_path / "CNAECSV.D51213"
+        csv_file.write_text("data")
+
+        mock_downloader = MagicMock()
+        mock_downloader.get_latest_directory.return_value = "2024-01"
+        mock_downloader.get_directory_files.return_value = ["Cnaes.zip"]
+        mock_downloader.download_file.return_value = [csv_file]
+        mock_downloader_cls.return_value = mock_downloader
+
+        mock_process_file.return_value = iter(
+            [(pl.DataFrame({"codigo": ["001"], "descricao": ["Test"]}), "cnaes", ["codigo", "descricao"])]
+        )
+
+        main(cfg=cfg)
+
+        assert (tmp_path / "parquet" / "cnaes.parquet").exists()
+        mock_downloader.download_file.assert_called()
+
+    @patch("main.pg_worker")
+    @patch("database.Database")
+    @patch("main.Downloader")
+    @patch("main.parse_args")
+    def test_postgres_parallel_submits_workers(
+        self,
+        mock_args: MagicMock,
+        mock_downloader_cls: MagicMock,
+        mock_db_cls: MagicMock,
+        mock_pg_worker: MagicMock,
+        cfg: Config,
+    ) -> None:
+        """With workers > 1 in postgres mode, pg_worker should be submitted to executor."""
+        mock_args.return_value = MagicMock(list=False, month=None, force=False)
+        cfg.output_format = "postgres"
+        cfg.database_url = "postgresql://test"
+        cfg.batch_size = 500000
+        cfg.keep_files = False
+        cfg.process_workers = 2
+        cfg.loading_strategy = "upsert"
+
+        mock_downloader = MagicMock()
+        mock_downloader.get_latest_directory.return_value = "2024-01"
+        mock_downloader.get_directory_files.return_value = ["Cnaes.zip", "Motivos.zip"]
+        mock_downloader_cls.return_value = mock_downloader
+
+        mock_db = MagicMock()
+        mock_db.get_processed_files.return_value = set()
+        mock_db_cls.return_value = mock_db
+
+        mock_pg_worker.return_value = None
+
+        main(cfg=cfg)
+
+        assert mock_pg_worker.call_count == 2
+
+    @patch("main.pg_worker")
+    @patch("database.Database")
+    @patch("main.Downloader")
+    @patch("main.parse_args")
+    def test_parallel_worker_failure_aborts_pipeline(
+        self,
+        mock_args: MagicMock,
+        mock_downloader_cls: MagicMock,
+        mock_db_cls: MagicMock,
+        mock_pg_worker: MagicMock,
+        cfg: Config,
+    ) -> None:
+        """A failing worker aborts the pipeline after the current group finishes."""
+        mock_args.return_value = MagicMock(list=False, month=None, force=False)
+        cfg.output_format = "postgres"
+        cfg.database_url = "postgresql://test"
+        cfg.batch_size = 500000
+        cfg.keep_files = False
+        cfg.process_workers = 2
+        cfg.loading_strategy = "upsert"
+
+        mock_downloader = MagicMock()
+        mock_downloader.get_latest_directory.return_value = "2024-01"
+        mock_downloader.get_directory_files.return_value = ["Cnaes.zip", "Motivos.zip"]
+        mock_downloader_cls.return_value = mock_downloader
+
+        mock_db = MagicMock()
+        mock_db.get_processed_files.return_value = set()
+        mock_db_cls.return_value = mock_db
+
+        mock_pg_worker.side_effect = [Exception("worker crashed"), None]
+
+        with pytest.raises(SystemExit):
+            main(cfg=cfg)
+
+
+class TestPreTruncation:
+    """Test pre-truncation logic for parallel replace strategy."""
+
+    @patch("main.pg_worker")
+    @patch("database.Database")
+    @patch("main.Downloader")
+    @patch("main.parse_args")
+    def test_replace_strategy_pre_truncates(
+        self,
+        mock_args: MagicMock,
+        mock_downloader_cls: MagicMock,
+        mock_db_cls: MagicMock,
+        mock_pg_worker: MagicMock,
+        cfg: Config,
+    ) -> None:
+        """With workers > 1 and replace strategy, tables should be truncated before workers."""
+        mock_args.return_value = MagicMock(list=False, month=None, force=False)
+        cfg.output_format = "postgres"
+        cfg.database_url = "postgresql://test"
+        cfg.batch_size = 500000
+        cfg.keep_files = False
+        cfg.process_workers = 2
+        cfg.loading_strategy = "replace"
+
+        mock_downloader = MagicMock()
+        mock_downloader.get_latest_directory.return_value = "2024-01"
+        mock_downloader.get_directory_files.return_value = ["Empresas0.zip", "Empresas1.zip"]
+        mock_downloader_cls.return_value = mock_downloader
+
+        mock_db = MagicMock()
+        mock_db.get_processed_files.return_value = set()
+        mock_db_cls.return_value = mock_db
+        mock_pg_worker.return_value = None
+
+        main(cfg=cfg)
+
+        mock_db.truncate_tables.assert_called_once_with({"empresas"})
+
+        # Workers should receive pre_truncated set
+        for call in mock_pg_worker.call_args_list:
+            pre_truncated_arg = call[0][4]
+            assert "empresas" in pre_truncated_arg
+
+    @patch("main.pg_worker")
+    @patch("database.Database")
+    @patch("main.Downloader")
+    @patch("main.parse_args")
+    def test_upsert_strategy_does_not_truncate(
+        self,
+        mock_args: MagicMock,
+        mock_downloader_cls: MagicMock,
+        mock_db_cls: MagicMock,
+        mock_pg_worker: MagicMock,
+        cfg: Config,
+    ) -> None:
+        """With workers > 1 and upsert strategy, tables should NOT be truncated."""
+        mock_args.return_value = MagicMock(list=False, month=None, force=False)
+        cfg.output_format = "postgres"
+        cfg.database_url = "postgresql://test"
+        cfg.batch_size = 500000
+        cfg.keep_files = False
+        cfg.process_workers = 2
+        cfg.loading_strategy = "upsert"
+
+        mock_downloader = MagicMock()
+        mock_downloader.get_latest_directory.return_value = "2024-01"
+        mock_downloader.get_directory_files.return_value = ["Cnaes.zip"]
+        mock_downloader_cls.return_value = mock_downloader
+
+        mock_db = MagicMock()
+        mock_db.get_processed_files.return_value = set()
+        mock_db_cls.return_value = mock_db
+        mock_pg_worker.return_value = None
+
+        main(cfg=cfg)
+
+        mock_db.truncate_tables.assert_not_called()
+
+
+def create_existing_export(output: Path) -> None:
+    writer = ParquetWriter(output, source_month="2024-01")
+    writer.write_batch(pl.DataFrame({"codigo": ["0111301"], "descricao": ["Arroz"]}), "cnaes")
+    writer.close()
+
+
+class TestParquetResume:
+    """Test parquet resume/skip logic for already-exported tables."""
+
+    @patch("main.process_file")
+    @patch("main.Downloader")
+    @patch("main.parse_args")
+    def test_skips_already_exported_table(
+        self,
+        mock_args: MagicMock,
+        mock_downloader_cls: MagicMock,
+        mock_process_file: MagicMock,
+        tmp_path: Path,
+        cfg: Config,
+    ) -> None:
+        """Tables with existing parquet files should be skipped entirely."""
+        parquet_dir = tmp_path / "parquet"
+        parquet_dir.mkdir()
+        # Pre-create cnaes.parquet to simulate prior export
+        create_existing_export(parquet_dir)
+
+        mock_args.return_value = MagicMock(list=False, month=None, force=False)
+        cfg.output_format = "parquet"
+        cfg.post_file_command = ""
+        cfg.parquet_output_dir = str(parquet_dir)
+        cfg.batch_size = 500000
+        cfg.keep_files = False
+        cfg.process_workers = 1
+
+        mock_downloader = MagicMock()
+        mock_downloader.get_latest_directory.return_value = "2024-01"
+        mock_downloader.get_directory_files.return_value = ["Cnaes.zip"]
+        mock_downloader_cls.return_value = mock_downloader
+
+        main(cfg=cfg)
+
+        # download_files should never be called — table was skipped
+        mock_downloader.download_files.assert_not_called()
+        mock_process_file.assert_not_called()
+
+    @patch("main.process_file")
+    @patch("main.Downloader")
+    @patch("main.parse_args")
+    def test_processes_only_missing_tables(
+        self,
+        mock_args: MagicMock,
+        mock_downloader_cls: MagicMock,
+        mock_process_file: MagicMock,
+        tmp_path: Path,
+        cfg: Config,
+    ) -> None:
+        """Only tables without existing parquet files should be processed."""
+        parquet_dir = tmp_path / "parquet"
+        parquet_dir.mkdir()
+        # cnaes already exported, motivos not
+        create_existing_export(parquet_dir)
+
+        mock_args.return_value = MagicMock(list=False, month=None, force=False)
+        cfg.output_format = "parquet"
+        cfg.post_file_command = ""
+        cfg.parquet_output_dir = str(parquet_dir)
+        cfg.batch_size = 500000
+        cfg.keep_files = True
+        cfg.process_workers = 1
+
+        csv_file = tmp_path / "MOTICSV.D51213"
+        csv_file.write_text("data")
+
+        mock_downloader = MagicMock()
+        mock_downloader.get_latest_directory.return_value = "2024-01"
+        mock_downloader.get_directory_files.return_value = ["Cnaes.zip", "Motivos.zip"]
+        mock_downloader.download_files.return_value = downloads([(csv_file, "Motivos.zip")])
+        mock_downloader_cls.return_value = mock_downloader
+
+        mock_process_file.return_value = iter(
+            [(pl.DataFrame({"codigo": ["001"], "descricao": ["Test"]}), "motivos", ["codigo", "descricao"])]
+        )
+
+        main(cfg=cfg)
+
+        # Only motivos should have been processed
+        mock_process_file.assert_called_once()
+        assert (parquet_dir / "motivos.parquet").exists()
+
+    @patch("main.parquet_worker")
+    @patch("main.Downloader")
+    @patch("main.parse_args")
+    def test_parallel_parquet_worker_failure_aborts(
+        self,
+        mock_args: MagicMock,
+        mock_downloader_cls: MagicMock,
+        mock_parquet_worker: MagicMock,
+        tmp_path: Path,
+        cfg: Config,
+    ) -> None:
+        """Parallel parquet worker failure should abort the pipeline."""
+        mock_args.return_value = MagicMock(list=False, month=None, force=False)
+        cfg.output_format = "parquet"
+        cfg.post_file_command = ""
+        cfg.parquet_output_dir = str(tmp_path / "parquet")
+        cfg.batch_size = 500000
+        cfg.keep_files = False
+        cfg.process_workers = 2
+
+        mock_downloader = MagicMock()
+        mock_downloader.get_latest_directory.return_value = "2024-01"
+        mock_downloader.get_directory_files.return_value = ["Cnaes.zip", "Motivos.zip"]
+        mock_downloader_cls.return_value = mock_downloader
+
+        mock_parquet_worker.side_effect = [Exception("worker crashed"), None]
+
+        with pytest.raises(SystemExit):
+            main(cfg=cfg)
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_parquet_write_failure_stops_export(workers: int, cfg: Config, tmp_path: Path) -> None:
+    cfg.output_format = "parquet"
+    cfg.process_workers = workers
+    cfg.post_file_command = "publish"
+    source = tmp_path / "CNAECSV.csv"
+    source.write_text("0111301;Cultivo de arroz\n", encoding="ISO-8859-1")
+
+    with (
+        patch("main.parse_args", return_value=MagicMock(list=False, month=None, force=False)),
+        patch("main.Downloader") as downloader_cls,
+        patch("parquet_writer.ParquetWriter") as writer_cls,
+        patch("main.subprocess.run") as publish,
+    ):
+        downloader = downloader_cls.return_value
+        downloader.get_latest_directory.return_value = "2024-01"
+        downloader.get_directory_files.return_value = ["Cnaes.zip", "Empresas0.zip"]
+        downloader.download_file.return_value = [source]
+        downloader.download_files.return_value = downloads([(source, "Cnaes.zip")])
+        writer = writer_cls.return_value
+        writer.write_batch.side_effect = OSError("disk full")
+
+        with pytest.raises(SystemExit) as error:
+            main(cfg=cfg)
+
+        assert error.value.code == 1
+        writer.write_batch.assert_called_once()
+        writer.flush_table.assert_not_called()
+        writer.write_manifest.assert_not_called()
+        publish.assert_not_called()
+        downloader.cleanup.assert_called_once()
+        # Global cleanup is mocked; the failed CSV must not be explicitly unlinked.
+        assert source.exists()
+        if workers == 1:
+            downloader.download_files.assert_called_once_with("2024-01", ["Cnaes.zip"])
+        else:
+            downloader.download_file.assert_called_once_with("2024-01", "Cnaes.zip")
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_empty_parquet_input_does_not_publish_a_file(workers: int, cfg: Config, tmp_path: Path) -> None:
+    """An empty source must not be published as a complete export."""
+    cfg.output_format = "parquet"
+    cfg.process_workers = workers
+    cfg.post_file_command = "publish"
+    source = tmp_path / "CNAECSV.csv"
+    source.write_text("", encoding="ISO-8859-1")
+
+    with (
+        patch("main.parse_args", return_value=MagicMock(list=False, month=None, force=False)),
+        patch("main.Downloader") as downloader_cls,
+        patch("main.subprocess.run") as publish,
+    ):
+        downloader = downloader_cls.return_value
+        downloader.get_latest_directory.return_value = "2024-01"
+        downloader.get_directory_files.return_value = ["Cnaes.zip"]
+        downloader.download_file.return_value = [source]
+        downloader.download_files.return_value = downloads([(source, "Cnaes.zip")])
+
+        with pytest.raises(SystemExit) as error:
+            main(cfg=cfg)
+        assert error.value.code == 1
+
+        publish.assert_not_called()
+        downloader.cleanup.assert_called_once()
+        assert not (Path(cfg.parquet_output_dir) / "cnaes.parquet").exists()
+        assert not (Path(cfg.parquet_output_dir) / "manifest.json").exists()
+        assert source.exists()
+
+
+@pytest.mark.parametrize("keep_files", [False, True])
+def test_postgres_marks_success_before_optional_cleanup(keep_files: bool, cfg: Config, tmp_path: Path) -> None:
+    cfg.keep_files = keep_files
+    source = tmp_path / "CNAECSV.csv"
+    source.write_text("0111301;Cultivo de arroz\n", encoding="ISO-8859-1")
+    downloader = MagicMock()
+    downloader.download_file.return_value = [source]
+
+    with patch("database.Database") as db_cls:
+        db = db_cls.return_value
+
+        def mark_processed(directory: str, filename: str) -> None:
+            assert source.exists()
+            assert (directory, filename) == ("2024-01", "Cnaes.zip")
+            db.bulk_upsert.assert_called_once()
+
+        db.mark_processed.side_effect = mark_processed
+        pg_worker("Cnaes.zip", "2024-01", downloader, cfg)
+
+        db.mark_processed.assert_called_once()
+        db.disconnect.assert_called_once()
+        assert source.exists() is keep_files
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_parquet_retry_after_later_shard_failure(workers: int, cfg: Config, tmp_path: Path) -> None:
+    cfg.output_format = "parquet"
+    cfg.process_workers = workers
+    source = tmp_path / "CNAECSV.csv"
+
+    def extracted(*args: str) -> Iterator[Path]:
+        source.write_text("0111301;Arroz\n")
+        yield source
+        raise OSError("later shard failed")
+
+    def sequential(directory: str, files: list[str]) -> Iterator[tuple[Path, str]]:
+        for path in extracted():
+            yield path, files[0]
+
+    with (
+        patch("main.parse_args", return_value=MagicMock(list=False, month=None, force=False)),
+        patch("main.Downloader") as cls,
+    ):
+        dl = cls.return_value
+        dl.get_latest_directory.return_value = "2024-01"
+        dl.get_directory_files.return_value = ["Cnaes.zip"]
+        dl.download_file.side_effect = extracted
+        dl.download_files.side_effect = sequential
+        with pytest.raises(SystemExit):
+            main(cfg)
+        output = Path(cfg.parquet_output_dir)
+        assert not (output / "cnaes.parquet").exists()
+        assert not (output / "manifest.json").exists()
+        assert (output / "cnaes.parquet.partial").exists()
+
+        source.write_text("0111301;Arroz\n0111302;Milho\n")
+        dl.download_file.side_effect = None
+        dl.download_file.return_value = [source]
+        dl.download_files.side_effect = None
+        dl.download_files.return_value = downloads([(source, "Cnaes.zip")])
+        main(cfg)
+        assert pl.read_parquet(output / "cnaes.parquet").height == 2
+        assert not (output / "cnaes.parquet.partial").exists()
+        manifest = json.loads((output / "manifest.json").read_text())
+        assert manifest["tables"]["cnaes"]["rows"] == 2
+
+
+def test_resumed_manifest_includes_existing_and_new_tables(cfg: Config, tmp_path: Path) -> None:
+    cfg.output_format = "parquet"
+    output = Path(cfg.parquet_output_dir)
+    output.mkdir()
+    create_existing_export(output)
+    source = tmp_path / "MOTICSV.csv"
+    source.write_text("01;Extincao\n")
+    with (
+        patch("main.parse_args", return_value=MagicMock(list=False, month=None, force=False)),
+        patch("main.Downloader") as cls,
+    ):
+        dl = cls.return_value
+        dl.get_latest_directory.return_value = "2024-01"
+        dl.get_directory_files.return_value = ["Cnaes.zip", "Motivos.zip"]
+        dl.download_files.return_value = downloads([(source, "Motivos.zip")])
+        main(cfg)
+        first = json.loads((output / "manifest.json").read_text())
+        assert set(first["tables"]) == {"cnaes", "motivos"}
+        assert first["totals"]["rows"] == 2
+        assert first["totals"]["sizeBytes"] == sum(p.stat().st_size for p in output.glob("*.parquet"))
+        dl.download_files.reset_mock()
+        main(cfg)
+        second = json.loads((output / "manifest.json").read_text())
+        assert second["tables"] == first["tables"]
+        assert second["totals"] == first["totals"]
+        dl.download_files.assert_not_called()
+
+
+def test_parquet_resume_rejects_unreadable_file(cfg: Config) -> None:
+    cfg.output_format = "parquet"
+    output = Path(cfg.parquet_output_dir)
+    output.mkdir()
+    (output / "cnaes.parquet").write_bytes(b"truncated")
+    (output / "manifest.json").write_text("previous manifest")
+    with (
+        patch("main.parse_args", return_value=MagicMock(list=False, month=None, force=False)),
+        patch("main.Downloader") as cls,
+    ):
+        dl = cls.return_value
+        dl.get_latest_directory.return_value = "2024-01"
+        dl.get_directory_files.return_value = ["Cnaes.zip"]
+        with pytest.raises(SystemExit) as error:
+            main(cfg)
+        assert error.value.code == 1
+        assert (output / "manifest.json").read_text() == "previous manifest"
+        dl.download_files.assert_not_called()
+        dl.cleanup.assert_called_once()
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_empty_postgres_source_is_not_marked(workers: int, cfg: Config, tmp_path: Path) -> None:
+    cfg.process_workers = workers
+    source = tmp_path / "CNAECSV.csv"
+    source.write_text("")
+    with (
+        patch("main.parse_args", return_value=MagicMock(list=False, month=None, force=False)),
+        patch("main.Downloader") as dl_cls,
+        patch("database.Database") as db_cls,
+    ):
+        dl = dl_cls.return_value
+        dl.get_latest_directory.return_value = "2024-01"
+        dl.get_directory_files.return_value = ["Cnaes.zip"]
+        dl.download_file.return_value = [source]
+        dl.download_archives.return_value = downloads([([source], "Cnaes.zip")])
+        db = db_cls.return_value
+        db.get_processed_files.return_value = []
+        with pytest.raises(SystemExit) as error:
+            main(cfg)
+        assert error.value.code == 1
+        db.mark_processed.assert_not_called()
+        db.bulk_upsert.assert_not_called()
+        assert source.exists()
+        dl.cleanup.assert_called_once()
+
+
+@pytest.mark.parametrize("mismatch", ["month", "typed", "schema", "legacy"])
+def test_parquet_resume_rejects_incompatible_output_before_processing(
+    mismatch: str, cfg: Config, caplog: pytest.LogCaptureFixture
+) -> None:
+    cfg.output_format = "parquet"
+    output = Path(cfg.parquet_output_dir)
+    output.mkdir()
+    existing = output / "empresas.parquet"
+    data = pl.DataFrame({"cnpj_basico": ["12345678"]})
+    if mismatch == "legacy":
+        data.write_parquet(existing)
+    else:
+        writer = ParquetWriter(
+            output, source_month="2023-12" if mismatch == "month" else "2024-01", typed=mismatch == "typed"
+        )
+        if mismatch == "schema":
+            writer.provenance["cnpj.schemaVersion"] = "old"
+        writer.write_batch(data, "empresas")
+        writer.close()
+    previous_file = existing.read_bytes()
+    manifest = output / "manifest.json"
+    manifest.write_text("previous manifest")
+    with (
+        patch("main.parse_args", return_value=MagicMock(list=False, month=None, force=False)),
+        patch("main.Downloader") as cls,
+    ):
+        dl = cls.return_value
+        dl.get_latest_directory.return_value = "2024-01"
+        dl.get_directory_files.return_value = ["Cnaes.zip", "Empresas0.zip"]
+        with pytest.raises(SystemExit) as error:
+            main(cfg)
+        assert error.value.code == 1
+        dl.download_file.assert_not_called()
+        dl.download_files.assert_not_called()
+    assert "Cannot resume empresas.parquet" in caplog.text
+    assert "fresh output directory" in caplog.text
+    assert existing.read_bytes() == previous_file
+    assert manifest.read_text() == "previous manifest"
+    assert not (output / "cnaes.parquet").exists()
+
+
+@pytest.mark.parametrize("output_format", ["postgres", "parquet"])
+def test_reports_unsupported_source_archives(cfg: Config, caplog: pytest.LogCaptureFixture, output_format: str) -> None:
+    cfg.output_format = output_format
+    with (
+        patch("main.parse_args", return_value=MagicMock(list=False, month=None, force=False)),
+        patch("main.Downloader") as downloader_cls,
+        patch("database.Database"),
+        patch("main.run_postgres"),
+        patch("main.run_parquet"),
+    ):
+        downloader = downloader_cls.return_value
+        downloader.get_latest_directory.return_value = "2024-01"
+        downloader.get_directory_files.return_value = ["Cnaes.zip", "Regimes.zip"]
+        main(cfg)
+    assert "Skipping unsupported source files: Regimes.zip" in caplog.text
+
+
+def test_failed_load_waits_for_in_flight_downloads_before_releasing_the_lock(cfg: Config) -> None:
+    """A load failure must not release TEMP_DIR while another download is still writing to it."""
+    cfg.output_format = "postgres"
+    cfg.download_workers = 2
+    finished: list[str] = []
+
+    def stream(self: Downloader, url: str, filename: str, zip_path: Path, part_path: Path) -> None:
+        if filename == "Empresas1.zip":
+            time.sleep(0.5)  # still streaming when Empresas0's load fails
+            finished.append(filename)
+        with zipfile.ZipFile(zip_path, "w") as z:
+            z.writestr("EMPRECSV", "1;x\n")
+
+    with (
+        patch("main.parse_args", return_value=MagicMock(list=False, month=None, force=False)),
+        patch("database.Database"),
+        patch.object(Downloader, "_download_zip_once", stream),
+        patch.object(Downloader, "get_latest_directory", return_value="2024-01"),
+        patch.object(Downloader, "get_directory_files", return_value=["Empresas0.zip", "Empresas1.zip"]),
+        patch("main.load_postgres_archive", side_effect=RuntimeError("load failed")),
+        pytest.raises(SystemExit),
+    ):
+        main(cfg)
+
+    assert finished == ["Empresas1.zip"], "main returned while a download was still running"

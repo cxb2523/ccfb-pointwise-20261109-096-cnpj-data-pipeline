@@ -1,0 +1,20 @@
+pre-push:
+  commands:
+    sync:
+      run: git pull --rebase origin main
+
+pre-commit:
+  commands:
+    typecheck:
+      run: uv run --frozen pyright
+    ruff:
+      glob: "*.py"
+      run: uv run ruff check --fix {staged_files} && git add {staged_files}
+    ruff-format:
+      glob: "*.py"
+      run: uv run ruff format {staged_files} && git add {staged_files}
+    ruff-format-check:
+      glob: "*.py"
+      run: uv run ruff format --check .
+    pytest:
+      run: uv run pytest

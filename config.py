@@ -1,0 +1,80 @@
+"""Configuration for CNPJ data pipeline."""
+
+import os
+from dataclasses import dataclass
+
+from dotenv import load_dotenv
+
+
+@dataclass
+class Config:
+    """Pipeline configuration with sensible defaults."""
+
+    database_url: str
+    batch_size: int = 500000
+    temp_dir: str = "./temp"
+    download_workers: int = 4
+    process_workers: int = 1
+    retry_attempts: int = 3
+    retry_delay: int = 5
+    connect_timeout: int = 30
+    # Metadata calls use read_timeout; streaming downloads use stall_timeout
+    # as the between-bytes read timeout so silent streams resume quickly.
+    read_timeout: int = 300
+    stall_timeout: int = 30
+    stall_degrade_threshold: int = 3
+    progress_log_interval: int = 30
+    keep_files: bool = False
+    loading_strategy: str = "upsert"  # "upsert" or "replace"
+    output_format: str = "postgres"  # "postgres" or "parquet"
+    parquet_output_dir: str = "./parquet"
+    # When true (opt-in for backward compatibility in v1.x), cast date and
+    # numeric columns to their typed Polars forms before writing Parquet.
+    # The Postgres output is already typed via initial.sql column types;
+    # this flag opts Parquet into those date and numeric types.
+    parquet_typed_output: bool = False
+    # Receives the final Parquet path; repeats for resumed tables before manifest publication.
+    # Must be idempotent: every run with this command can execute it again.
+    post_file_command: str = ""
+    base_url: str = "https://arquivos.receitafederal.gov.br/public.php/webdav"
+    share_token: str = "YggdBLfdninEJX9"
+
+    def __post_init__(self) -> None:
+        if self.output_format not in ("postgres", "parquet"):
+            raise ValueError("OUTPUT_FORMAT must be postgres or parquet")
+        if self.loading_strategy not in ("upsert", "replace"):
+            raise ValueError("LOADING_STRATEGY must be upsert or replace")
+        for name, value in {
+            "BATCH_SIZE": self.batch_size,
+            "DOWNLOAD_WORKERS": self.download_workers,
+            "PROCESS_WORKERS": self.process_workers,
+        }.items():
+            if value < 1:
+                raise ValueError(f"{name} must be positive")
+
+    @classmethod
+    def from_env(cls) -> "Config":
+        """Create config from environment variables."""
+        load_dotenv()
+        return cls(
+            database_url=os.getenv("DATABASE_URL", ""),
+            batch_size=int(os.getenv("BATCH_SIZE", "500000")),
+            temp_dir=os.getenv("TEMP_DIR", "./temp"),
+            download_workers=int(os.getenv("DOWNLOAD_WORKERS", "4")),
+            process_workers=int(os.getenv("PROCESS_WORKERS", "1")),
+            retry_attempts=int(os.getenv("RETRY_ATTEMPTS", "3")),
+            retry_delay=int(os.getenv("RETRY_DELAY", "5")),
+            connect_timeout=int(os.getenv("CONNECT_TIMEOUT", "30")),
+            read_timeout=int(os.getenv("READ_TIMEOUT", "300")),
+            stall_timeout=int(os.getenv("STALL_TIMEOUT", "30")),
+            stall_degrade_threshold=int(os.getenv("STALL_DEGRADE_THRESHOLD", "3")),
+            progress_log_interval=int(os.getenv("PROGRESS_LOG_INTERVAL", "30")),
+            keep_files=os.getenv("KEEP_DOWNLOADED_FILES", "false").lower() == "true",
+            loading_strategy=os.getenv("LOADING_STRATEGY", "upsert").lower(),
+            output_format=os.getenv("OUTPUT_FORMAT", "postgres").lower(),
+            parquet_output_dir=os.getenv("PARQUET_OUTPUT_DIR", "./parquet"),
+            parquet_typed_output=os.getenv("PARQUET_TYPED_OUTPUT", "false").lower() == "true",
+            post_file_command=os.getenv("POST_FILE_COMMAND", ""),
+            base_url=os.getenv("BASE_URL", "https://arquivos.receitafederal.gov.br/public.php/webdav"),
+            share_token=os.getenv("SHARE_TOKEN", "YggdBLfdninEJX9"),
+        )
