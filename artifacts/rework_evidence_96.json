@@ -1,0 +1,17 @@
+{
+  "uid": "62",
+  "session_id": "532ade74-14e4-4766-86ad-285c83b13cf2",
+  "model": "auto_model/urm",
+  "context_window": 1000000,
+  "stream_file": "run_logs/claude_run_96.stream.jsonl",
+  "stream_sha256": "fe5f4bfee79b92ee5c39298951d45f9386fa44bf99a4cf1b4a5572fb2f0f0fc4",
+  "raw_context_excerpt": "annotation_state/rework_context_raw_96.jsonl",
+  "same_session_cwd": "D:\\gsb-auto\\batches\\pointwise-20261109\\096-cnpj-data-pipeline\\A",
+  "same_session_cli_version": "2.1.239",
+  "current_host_platform": "Windows-11-10.0.26300-SP0",
+  "evidence_basis": [
+    "Final stream modelUsage records contextWindow=1000000.",
+    "Raw session metadata records the same session cwd and CLI version.",
+    "The Windows drive-path cwd and current recorder host both identify Windows."
+  ]
+}
